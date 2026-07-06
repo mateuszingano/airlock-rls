@@ -28,6 +28,75 @@ export function classifyProbe(table, status, rows) {
   return null
 }
 
+/**
+ * Classify a write probe. We POST a minimal payload; the goal is to learn
+ * whether RLS would ALLOW an anonymous write — without persisting real data.
+ *
+ *   RLS error / 401 / 403           → blocked (safe)
+ *   201 created                     → PROVEN write leak (a row was inserted)
+ *   400/409 NON-RLS (constraint)    → RLS let it through; only a column
+ *                                     constraint stopped it → write is exposed
+ *                                     (an attacker can craft a valid row). Safe:
+ *                                     nothing was persisted.
+ * @returns {import('./audit.mjs').Finding|null}
+ */
+export function classifyWriteProbe(table, status, bodyText = '') {
+  const rlsBlocked = status === 401 || status === 403 || /row-level security|permission denied/i.test(bodyText)
+  if (rlsBlocked) return null
+  if (status === 201) {
+    return {
+      kind: 'anon_write_leak',
+      severity: 'fail',
+      object: table,
+      detail: 'anon key INSERTED a row over the REST API — writes are open (a test row was created; delete it)',
+    }
+  }
+  if ((status === 400 || status === 409) && !/row-level security/i.test(bodyText)) {
+    return {
+      kind: 'anon_write_leak',
+      severity: 'fail',
+      object: table,
+      detail: 'anon write passed RLS (stopped only by a column constraint) — an attacker can forge a valid row',
+    }
+  }
+  return null // 404 (not exposed) or anything else → no proven write leak
+}
+
+/**
+ * Probe each table for an anonymous INSERT. Sends `{}` — on any table with a
+ * required column this fails the constraint (revealing RLS passed) WITHOUT
+ * persisting a row. Opt-in, because on an all-nullable open table it can create
+ * a row (which is itself the proof).
+ * @returns {Promise<{findings: import('./audit.mjs').Finding[], probed: number}>}
+ */
+export async function probeAnonWrites({ projectUrl, anonKey, tables, fetchImpl = fetch }) {
+  if (!projectUrl || !anonKey) throw new Error('DAST needs { projectUrl, anonKey }')
+  const base = projectUrl.replace(/\/$/, '')
+  const list = tables || []
+  const findings = []
+  for (const t of list) {
+    const res = await fetchImpl(`${base}/rest/v1/${encodeURIComponent(t)}`, {
+      method: 'POST',
+      headers: {
+        apikey: anonKey,
+        Authorization: `Bearer ${anonKey}`,
+        'Content-Type': 'application/json',
+        Prefer: 'return=minimal',
+      },
+      body: '{}',
+    })
+    let body = ''
+    try {
+      body = await res.text()
+    } catch {
+      body = ''
+    }
+    const f = classifyWriteProbe(t, res.status, body)
+    if (f) findings.push(f)
+  }
+  return { findings, probed: list.length }
+}
+
 /** Discover the tables the REST API exposes, using the anon key's OpenAPI root. */
 export async function discoverTables({ projectUrl, anonKey, fetchImpl = fetch }) {
   const base = projectUrl.replace(/\/$/, '')

@@ -170,6 +170,8 @@ export function buildResult({
   publicBuckets = [],
   secDefFns = [],
   views = [],
+  storagePolicies = [],
+  realtimeTables = [],
   grants = null,
   allow = new Set(),
 } = {}) {
@@ -227,14 +229,45 @@ export function buildResult({
     else findings.push(f)
   }
   for (const fn of secDefFns) {
-    const f = {
-      kind: 'security_definer',
-      severity: 'warn',
-      object: `fn:${fn.proname}`,
-      detail: 'SECURITY DEFINER function runs as its owner and can bypass RLS — review who can call it',
+    // A SECURITY DEFINER function runs as its owner (bypassing RLS). The real
+    // danger is when the anon/authenticated role can EXECUTE it.
+    const anonExec = fn.anon_exec === true || fn.anon_exec === 'true'
+    const authExec = fn.auth_exec === true || fn.auth_exec === 'true'
+    let f
+    if (anonExec) {
+      f = { kind: 'anon_executes_definer', severity: 'fail', object: `fn:${fn.proname}`,
+        detail: 'anon can EXECUTE this SECURITY DEFINER function — it runs as the owner and bypasses RLS' }
+    } else if (authExec) {
+      f = { kind: 'security_definer', severity: 'warn', object: `fn:${fn.proname}`,
+        detail: 'any authenticated user can EXECUTE this SECURITY DEFINER function (runs as owner, bypasses RLS) — review' }
+    } else {
+      f = { kind: 'security_definer', severity: 'warn', object: `fn:${fn.proname}`,
+        detail: 'SECURITY DEFINER function runs as its owner and can bypass RLS — review who can call it' }
     }
     if (allowSet.has(fn.proname)) allowed.push(f)
     else findings.push(f)
+  }
+  // Storage object-level policies (storage.objects) — same logic, prefixed.
+  for (const p of storagePolicies) {
+    for (const f of classifyPolicy({ ...p, tablename: 'storage.objects' }, { grants: null, restrictives: [] })) {
+      if (allowSet.has(p.policyname)) allowed.push(f)
+      else findings.push({ ...f, kind: 'storage_' + f.kind })
+    }
+  }
+  // Realtime: a published table whose rows are anon-readable also streams its
+  // changes to anonymous websocket subscribers.
+  const anonReadableTables = new Set(
+    findings.filter((f) => f.kind === 'rls_disabled' || f.kind === 'anon_unscoped' || (f.kind === 'permissive_true' && /\[(SELECT|ALL)\]/.test(f.detail)))
+      .map((f) => (f.kind === 'rls_disabled' ? f.object : (f.object.match(/^(.+?)\."/) || [])[1]))
+  )
+  for (const t of realtimeTables) {
+    const name = t.tablename || t
+    if (anonReadableTables.has(name)) {
+      const f = { kind: 'realtime_exposure', severity: 'warn', object: `realtime:${name}`,
+        detail: `table "${name}" streams changes via Realtime and is anon-readable — its row changes leak to anonymous subscribers` }
+      if (allowSet.has(name)) allowed.push(f)
+      else findings.push(f)
+    }
   }
   for (const v of views) {
     // A view without security_invoker runs as its owner and reads underlying
@@ -303,14 +336,39 @@ export async function audit({ dbUrl, schema = 'public', allow = [] } = {}) {
       `select tablename from pg_catalog.pg_tables where schemaname = $1 order by tablename`,
       [schema]
     )
-    // SECURITY DEFINER functions in the schema — run as owner, can bypass RLS.
+    // SECURITY DEFINER functions + who can EXECUTE them (anon running owner-priv
+    // code is the real danger).
     const { rows: secDefFns } = await client.query(
-      `select p.proname
+      `select p.proname,
+              has_function_privilege('anon', p.oid, 'EXECUTE') as anon_exec,
+              has_function_privilege('authenticated', p.oid, 'EXECUTE') as auth_exec
          from pg_proc p join pg_namespace n on n.oid = p.pronamespace
         where n.nspname = $1 and p.prosecdef = true
         order by p.proname`,
       [schema]
     )
+    // Storage object-level RLS (policies on storage.objects).
+    let storagePolicies = []
+    try {
+      const { rows } = await client.query(
+        `select tablename, policyname, cmd, roles, qual, with_check, permissive
+           from pg_policies where schemaname = 'storage' and tablename = 'objects'`
+      )
+      storagePolicies = rows
+    } catch {
+      storagePolicies = []
+    }
+    // Realtime: tables published to the supabase_realtime publication.
+    let realtimeTables = []
+    try {
+      const { rows } = await client.query(
+        `select tablename from pg_publication_tables where pubname = 'supabase_realtime' and schemaname = $1`,
+        [schema]
+      )
+      realtimeTables = rows
+    } catch {
+      realtimeTables = []
+    }
     // Views that bypass RLS (security_invoker off = runs as owner).
     const { rows: views } = await client.query(
       `select c.relname as viewname,
@@ -331,7 +389,7 @@ export async function audit({ dbUrl, schema = 'public', allow = [] } = {}) {
     } catch {
       publicBuckets = [] // no storage schema (not a Supabase DB) — skip
     }
-    return buildResult({ schema, noRls, policies, allTables, publicBuckets, secDefFns, views, grants, allow })
+    return buildResult({ schema, noRls, policies, allTables, publicBuckets, secDefFns, views, storagePolicies, realtimeTables, grants, allow })
   } finally {
     await client.end()
   }

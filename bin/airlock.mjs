@@ -20,7 +20,7 @@
 // Get the URL from `supabase status` (local) or your project's connection string.
 
 import { audit } from '../src/audit.mjs'
-import { probeAnonReads } from '../src/dast.mjs'
+import { probeAnonReads, probeAnonWrites } from '../src/dast.mjs'
 import { fuse, extractTable } from '../src/fuse.mjs'
 
 const RESET = '\x1b[0m'
@@ -43,6 +43,8 @@ Options:
   --schema <name>    Schema to audit (default: public).
   --url <url>        Supabase project URL — enables the DAST pass ($SUPABASE_URL).
   --anon-key <key>   Anon/publishable key for the DAST pass ($SUPABASE_ANON_KEY).
+  --dast-write       Also probe anonymous INSERTs (safe: an empty payload fails a
+                     column constraint, revealing RLS passed without persisting).
   --json             Print the result as JSON instead of a report.
   -h, --help         Show this help.
   -v, --version      Show the version.
@@ -53,7 +55,7 @@ actually read each table over the REST API and proves any anonymous leak.
 Exit codes: 0 = passed, 1 = exposure found, 2 = usage/connection error.`
 
 function parseArgs(argv) {
-  const opts = { dbUrl: undefined, schema: 'public', json: false, allow: [], url: undefined, anonKey: undefined }
+  const opts = { dbUrl: undefined, schema: 'public', json: false, allow: [], url: undefined, anonKey: undefined, dastWrite: false }
   const positional = []
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
@@ -80,6 +82,9 @@ function parseArgs(argv) {
         break
       case '--anon-key':
         opts.anonKey = argv[++i]
+        break
+      case '--dast-write':
+        opts.dastWrite = true
         break
       default:
         if (a.startsWith('--allow=')) opts.allow = splitList(a.slice('--allow='.length))
@@ -181,6 +186,21 @@ async function main() {
     const allowedTables = new Set(result.allowed.map(extractTable).filter(Boolean))
     const leakTables = findings.map((f) => f.object).filter((t) => !allowedTables.has(t))
     result = fuse(result, { leakTables, probed: result.tables })
+
+    // Opt-in: prove anonymous WRITES too (pattern 3).
+    if (opts.dastWrite) {
+      const { findings: writeFindings } = await probeAnonWrites({
+        projectUrl: opts.url,
+        anonKey: opts.anonKey,
+        tables: result.tables,
+      })
+      const freshWrites = writeFindings.filter((f) => !allowedTables.has(f.object))
+      result.findings.push(...freshWrites)
+      result.findings.sort((a, b) => (a.severity === b.severity ? 0 : a.severity === 'fail' ? -1 : 1))
+      result.problems = result.findings.filter((f) => f.severity === 'fail').length
+      result.warnings = result.findings.filter((f) => f.severity === 'warn').length
+      result.passed = result.problems === 0
+    }
   }
 
   if (opts.json) {

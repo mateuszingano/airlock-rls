@@ -191,3 +191,45 @@ test('correctness: unknown grants (null) assume granted — no false negative', 
   const r = buildResult({ schema: 'public', policies: [policy({ roles: ['anon'], qual: 'true' })] })
   assert.equal(r.problems, 1) // grants not provided → still flagged
 })
+
+// --- item 3: completeness ---
+
+test('a SECURITY DEFINER function anon can EXECUTE is a fail', () => {
+  const r = buildResult({ schema: 'public', secDefFns: [{ proname: 'run_as_owner', anon_exec: true, auth_exec: true }] })
+  assert.deepEqual(kinds(r), ['anon_executes_definer'])
+  assert.equal(r.problems, 1)
+})
+
+test('a SECURITY DEFINER function only the owner can call is just a warning', () => {
+  const r = buildResult({ schema: 'public', secDefFns: [{ proname: 'internal', anon_exec: false, auth_exec: false }] })
+  assert.deepEqual(kinds(r), ['security_definer'])
+  assert.equal(r.warnings, 1)
+})
+
+test('a permissive storage.objects policy is flagged (storage-prefixed)', () => {
+  const r = buildResult({
+    schema: 'public',
+    storagePolicies: [{ tablename: 'objects', policyname: 'public_files', cmd: 'SELECT', roles: ['anon'], qual: 'true', with_check: null, permissive: 'PERMISSIVE' }],
+  })
+  assert.deepEqual(kinds(r), ['storage_permissive_true'])
+})
+
+test('a Realtime-published anon-readable table warns about change leakage', () => {
+  const r = buildResult({
+    schema: 'public',
+    policies: [policy({ tablename: 'chat', roles: ['anon'], cmd: 'SELECT', qual: 'true' })],
+    realtimeTables: [{ tablename: 'chat' }],
+  })
+  const ks = kinds(r)
+  assert.ok(ks.includes('permissive_true'))
+  assert.ok(ks.includes('realtime_exposure'))
+})
+
+test('a Realtime table that is NOT anon-readable does not warn', () => {
+  const r = buildResult({
+    schema: 'public',
+    policies: [policy({ tablename: 'chat', roles: ['authenticated'], cmd: 'SELECT', qual: '(auth.uid() = owner)' })],
+    realtimeTables: [{ tablename: 'chat' }],
+  })
+  assert.ok(!kinds(r).includes('realtime_exposure'))
+})
