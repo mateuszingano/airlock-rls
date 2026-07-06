@@ -19,11 +19,13 @@
 //
 // Get the URL from `supabase status` (local) or your project's connection string.
 
-import { audit, permissiveLabel } from '../src/audit.mjs'
+import { audit } from '../src/audit.mjs'
+import { probeAnonReads } from '../src/dast.mjs'
 
 const RESET = '\x1b[0m'
 const RED = '\x1b[31m'
 const GREEN = '\x1b[32m'
+const YELLOW = '\x1b[33m'
 const DIM = '\x1b[2m'
 
 const HELP = `Airlock — the CI gate for Supabase RLS.
@@ -38,14 +40,19 @@ Options:
   --allow <names>    Comma-separated policy names to treat as intentionally
                      permissive (also read from $RLS_AUDIT_ALLOW).
   --schema <name>    Schema to audit (default: public).
+  --url <url>        Supabase project URL — enables the DAST pass ($SUPABASE_URL).
+  --anon-key <key>   Anon/publishable key for the DAST pass ($SUPABASE_ANON_KEY).
   --json             Print the result as JSON instead of a report.
   -h, --help         Show this help.
   -v, --version      Show the version.
 
+With --url and --anon-key, Airlock also runs DAST: it uses the anon key to
+actually read each table over the REST API and proves any anonymous leak.
+
 Exit codes: 0 = passed, 1 = exposure found, 2 = usage/connection error.`
 
 function parseArgs(argv) {
-  const opts = { dbUrl: undefined, schema: 'public', json: false, allow: [] }
+  const opts = { dbUrl: undefined, schema: 'public', json: false, allow: [], url: undefined, anonKey: undefined }
   const positional = []
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
@@ -67,14 +74,24 @@ function parseArgs(argv) {
       case '--schema':
         opts.schema = argv[++i] || 'public'
         break
+      case '--url':
+        opts.url = argv[++i]
+        break
+      case '--anon-key':
+        opts.anonKey = argv[++i]
+        break
       default:
         if (a.startsWith('--allow=')) opts.allow = splitList(a.slice('--allow='.length))
         else if (a.startsWith('--schema=')) opts.schema = a.slice('--schema='.length) || 'public'
+        else if (a.startsWith('--url=')) opts.url = a.slice('--url='.length)
+        else if (a.startsWith('--anon-key=')) opts.anonKey = a.slice('--anon-key='.length)
         else if (a.startsWith('-')) throw new UsageError(`Unknown option: ${a}`)
         else positional.push(a)
     }
   }
   opts.dbUrl = positional[0] || process.env.SUPABASE_DB_URL
+  opts.url = opts.url || process.env.SUPABASE_URL
+  opts.anonKey = opts.anonKey || process.env.SUPABASE_ANON_KEY
   // Env var merges with --allow; CLI names are additive, not a replacement.
   opts.allow = [...splitList(process.env.RLS_AUDIT_ALLOW), ...opts.allow]
   return opts
@@ -100,41 +117,34 @@ async function readVersion() {
 }
 
 function report(result) {
-  // Tables with RLS off.
-  if (result.tablesWithoutRls.length) {
-    console.log(
-      `${RED}✗ ${result.tablesWithoutRls.length} table(s) in "${result.schema}" have RLS DISABLED:${RESET}`
-    )
-    for (const t of result.tablesWithoutRls) console.log(`    - ${t}`)
+  const fails = result.findings.filter((f) => f.severity === 'fail')
+  const warns = result.findings.filter((f) => f.severity === 'warn')
+
+  if (fails.length) {
+    console.log(`${RED}✗ ${fails.length} problem(s) in "${result.schema}":${RESET}`)
+    for (const f of fails) console.log(`    ${RED}✗${RESET} ${f.object} ${DIM}${f.detail}${RESET}`)
   } else {
-    console.log(`${GREEN}✓ Every table in "${result.schema}" has RLS enabled.${RESET}`)
+    console.log(`${GREEN}✓ No RLS problems in "${result.schema}".${RESET}`)
   }
 
-  // Permissive policies.
-  if (result.permissive.length) {
-    console.log(
-      `${RED}✗ ${result.permissive.length} permissive policy(ies) (always-true) — these defeat tenant isolation:${RESET}`
-    )
-    for (const p of result.permissive) {
-      console.log(`    - ${p.table}."${p.policy}" [${p.cmd}] ${permissiveLabel(p)}`)
-    }
-  } else {
-    console.log(`${GREEN}✓ No permissive (always-true) policies found.${RESET}`)
+  if (warns.length) {
+    console.log(`${YELLOW}! ${warns.length} warning(s) worth a look:${RESET}`)
+    for (const f of warns) console.log(`    ${YELLOW}!${RESET} ${f.object} ${DIM}${f.detail}${RESET}`)
   }
 
-  // Allowed policies — surfaced so nobody forgets what was waved through.
   if (result.allowed.length) {
     console.log(
-      `${DIM}ℹ ${result.allowed.length} permissive policy(ies) allowed by config: ${result.allowed
-        .map((p) => p.policy)
+      `${DIM}ℹ ${result.allowed.length} finding(s) allowed by config: ${result.allowed
+        .map((f) => f.object)
         .join(', ')}${RESET}`
     )
   }
 
   if (result.passed) {
-    console.log(`\n${GREEN}RLS audit passed.${RESET}`)
+    const tail = warns.length ? ` ${DIM}(${warns.length} warning(s))${RESET}` : ''
+    console.log(`\n${GREEN}RLS audit passed.${RESET}${tail}`)
   } else {
-    console.log(`\n${RED}RLS audit failed: ${result.problems} issue(s) found.${RESET}`)
+    console.log(`\n${RED}RLS audit failed: ${result.problems} problem(s) found.${RESET}`)
   }
 }
 
@@ -157,9 +167,26 @@ async function main() {
 
   const result = await audit({ dbUrl: opts.dbUrl, schema: opts.schema, allow: opts.allow })
 
+  // DAST pass: prove exposure with the anon key against the tables we just found.
+  if (opts.url && opts.anonKey) {
+    const { findings } = await probeAnonReads({
+      projectUrl: opts.url,
+      anonKey: opts.anonKey,
+      tables: result.tables,
+    })
+    const fresh = findings.filter((f) => !opts.allow.includes(f.object))
+    result.findings.push(...fresh)
+    result.findings.sort((a, b) => (a.severity === b.severity ? 0 : a.severity === 'fail' ? -1 : 1))
+    result.problems = result.findings.filter((f) => f.severity === 'fail').length
+    result.warnings = result.findings.filter((f) => f.severity === 'warn').length
+    result.passed = result.problems === 0
+    result.dast = { probed: result.tables.length }
+  }
+
   if (opts.json) {
     console.log(JSON.stringify(result, null, 2))
   } else {
+    if (result.dast) console.log(`${DIM}(DAST: probed ${result.dast.probed} table(s) with the anon key)${RESET}`)
     report(result)
   }
 

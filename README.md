@@ -23,11 +23,33 @@ and **fails the build**, so the leak never merges.
 
 ## What it checks
 
-1. **Tables with RLS disabled** in the target schema — every row exposed to the API roles.
-2. **Permissive policies** — `USING (true)` or `WITH CHECK (true)`, which bypass isolation.
+Airlock audits the *logic* of your policies, not just their presence.
 
-Intentionally-public policies (a status page, say) can be waved through with an
-allow-list, so the gate stays honest without crying wolf.
+**Fails the build (exposure):**
+1. **`rls_disabled`** — a table with RLS off; every row exposed to the API roles.
+2. **`permissive_true`** — a policy `USING (true)` / `WITH CHECK (true)`.
+3. **`anon_unscoped`** — an anon-readable policy that doesn't scope to the user
+   (no `auth.uid()`) — everyone reads every row, even when it isn't literally `true`.
+4. **`anon_read_leak`** *(DAST)* — with an anon key, Airlock actually reads each
+   table over the REST API; a returned row is a **proven** leak, not an inference.
+
+**Warns (worth a review):**
+- **`authenticated_unscoped`** — any logged-in user reads all rows (role-only check).
+- **`write_unchecked`** — an INSERT/UPDATE policy with no `WITH CHECK` guard.
+- **`public_bucket`** — a public storage bucket.
+- **`security_definer`** — a function that runs as its owner and can bypass RLS.
+
+Intentionally-public policies (a status page, a contact form) can be waved
+through with an allow-list, so the gate stays honest without crying wolf.
+
+### The DAST pass (prove it, don't infer it)
+
+Give Airlock a project URL and an anon key and it runs the dynamic check the
+static scanners can't — it reads each table *as an anonymous attacker would*:
+
+```bash
+airlock "$SUPABASE_DB_URL" --url "$SUPABASE_URL" --anon-key "$SUPABASE_ANON_KEY"
+```
 
 ---
 
