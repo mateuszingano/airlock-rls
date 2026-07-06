@@ -117,6 +117,7 @@ export function buildResult({
   allTables = [],
   publicBuckets = [],
   secDefFns = [],
+  views = [],
   allow = new Set(),
 } = {}) {
   const allowSet = allow instanceof Set ? allow : new Set(allow)
@@ -159,6 +160,20 @@ export function buildResult({
     }
     if (allowSet.has(fn.proname)) allowed.push(f)
     else findings.push(f)
+  }
+  for (const v of views) {
+    // A view without security_invoker runs as its owner and reads underlying
+    // tables *bypassing the caller's RLS* — a classic way to leak past a policy.
+    if (String(v.security_invoker) !== 'true') {
+      const f = {
+        kind: 'view_bypasses_rls',
+        severity: 'warn',
+        object: `view:${v.viewname}`,
+        detail: 'view runs as its owner (security_invoker off) — it can bypass RLS on the tables it reads',
+      }
+      if (allowSet.has(v.viewname)) allowed.push(f)
+      else findings.push(f)
+    }
   }
 
   // fail before warn, stable otherwise
@@ -214,6 +229,16 @@ export async function audit({ dbUrl, schema = 'public', allow = [] } = {}) {
         order by p.proname`,
       [schema]
     )
+    // Views that bypass RLS (security_invoker off = runs as owner).
+    const { rows: views } = await client.query(
+      `select c.relname as viewname,
+              coalesce((select option_value from pg_options_to_table(c.reloptions)
+                         where option_name = 'security_invoker'), 'false') as security_invoker
+         from pg_class c join pg_namespace n on n.oid = c.relnamespace
+        where n.nspname = $1 and c.relkind = 'v'
+        order by c.relname`,
+      [schema]
+    )
     // Public storage buckets (Supabase only — guarded for plain Postgres).
     let publicBuckets = []
     try {
@@ -224,7 +249,7 @@ export async function audit({ dbUrl, schema = 'public', allow = [] } = {}) {
     } catch {
       publicBuckets = [] // no storage schema (not a Supabase DB) — skip
     }
-    return buildResult({ schema, noRls, policies, allTables, publicBuckets, secDefFns, allow })
+    return buildResult({ schema, noRls, policies, allTables, publicBuckets, secDefFns, views, allow })
   } finally {
     await client.end()
   }

@@ -132,6 +132,16 @@ test('coverage: a SECURITY DEFINER function is a warning', () => {
   assert.deepEqual(kinds(r), ['security_definer'])
 })
 
+test('coverage: a view without security_invoker is a warning', () => {
+  const r = buildResult({ schema: 'public', views: [{ viewname: 'user_emails', security_invoker: 'false' }] })
+  assert.deepEqual(kinds(r), ['view_bypasses_rls'])
+})
+
+test('coverage: a security_invoker view is NOT flagged', () => {
+  const r = buildResult({ schema: 'public', views: [{ viewname: 'safe_view', security_invoker: 'true' }] })
+  assert.equal(r.findings.length, 0)
+})
+
 test('result carries the full table list (for the DAST pass)', () => {
   const r = buildResult({ schema: 'public', allTables: [{ tablename: 'a' }, { tablename: 'b' }] })
   assert.deepEqual(r.tables, ['a', 'b'])
