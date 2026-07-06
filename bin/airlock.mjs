@@ -1,0 +1,175 @@
+#!/usr/bin/env node
+// Airlock CLI — the CI gate for Supabase RLS.
+//
+// Fails (exit 1) if any table in the target schema has RLS disabled, or if any
+// policy is permissive (USING (true) / WITH CHECK (true)). Drop it into your CI
+// so a migration can't ship a data leak.
+//
+// Usage:
+//   SUPABASE_DB_URL=postgresql://... airlock
+//   airlock postgresql://postgres:postgres@127.0.0.1:54322/postgres
+//   airlock --allow public_read,status_select
+//   airlock --json            # machine-readable output
+//   airlock --schema public   # audit a different schema
+//
+// Exit codes:
+//   0  audit passed — no exposure found
+//   1  audit failed — at least one exposed table or permissive policy
+//   2  usage / connection error (bad args, no URL, DB unreachable)
+//
+// Get the URL from `supabase status` (local) or your project's connection string.
+
+import { audit, permissiveLabel } from '../src/audit.mjs'
+
+const RESET = '\x1b[0m'
+const RED = '\x1b[31m'
+const GREEN = '\x1b[32m'
+const DIM = '\x1b[2m'
+
+const HELP = `Airlock — the CI gate for Supabase RLS.
+
+Usage:
+  airlock [DB_URL] [options]
+
+Arguments:
+  DB_URL             Postgres connection string. Falls back to $SUPABASE_DB_URL.
+
+Options:
+  --allow <names>    Comma-separated policy names to treat as intentionally
+                     permissive (also read from $RLS_AUDIT_ALLOW).
+  --schema <name>    Schema to audit (default: public).
+  --json             Print the result as JSON instead of a report.
+  -h, --help         Show this help.
+  -v, --version      Show the version.
+
+Exit codes: 0 = passed, 1 = exposure found, 2 = usage/connection error.`
+
+function parseArgs(argv) {
+  const opts = { dbUrl: undefined, schema: 'public', json: false, allow: [] }
+  const positional = []
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i]
+    switch (a) {
+      case '-h':
+      case '--help':
+        opts.help = true
+        break
+      case '-v':
+      case '--version':
+        opts.version = true
+        break
+      case '--json':
+        opts.json = true
+        break
+      case '--allow':
+        opts.allow = splitList(argv[++i])
+        break
+      case '--schema':
+        opts.schema = argv[++i] || 'public'
+        break
+      default:
+        if (a.startsWith('--allow=')) opts.allow = splitList(a.slice('--allow='.length))
+        else if (a.startsWith('--schema=')) opts.schema = a.slice('--schema='.length) || 'public'
+        else if (a.startsWith('-')) throw new UsageError(`Unknown option: ${a}`)
+        else positional.push(a)
+    }
+  }
+  opts.dbUrl = positional[0] || process.env.SUPABASE_DB_URL
+  // Env var merges with --allow; CLI names are additive, not a replacement.
+  opts.allow = [...splitList(process.env.RLS_AUDIT_ALLOW), ...opts.allow]
+  return opts
+}
+
+function splitList(v) {
+  return (v || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+}
+
+class UsageError extends Error {}
+
+async function readVersion() {
+  const { readFile } = await import('node:fs/promises')
+  const url = new URL('../package.json', import.meta.url)
+  try {
+    return JSON.parse(await readFile(url, 'utf8')).version || '0.0.0'
+  } catch {
+    return '0.0.0'
+  }
+}
+
+function report(result) {
+  // Tables with RLS off.
+  if (result.tablesWithoutRls.length) {
+    console.log(
+      `${RED}✗ ${result.tablesWithoutRls.length} table(s) in "${result.schema}" have RLS DISABLED:${RESET}`
+    )
+    for (const t of result.tablesWithoutRls) console.log(`    - ${t}`)
+  } else {
+    console.log(`${GREEN}✓ Every table in "${result.schema}" has RLS enabled.${RESET}`)
+  }
+
+  // Permissive policies.
+  if (result.permissive.length) {
+    console.log(
+      `${RED}✗ ${result.permissive.length} permissive policy(ies) (always-true) — these defeat tenant isolation:${RESET}`
+    )
+    for (const p of result.permissive) {
+      console.log(`    - ${p.table}."${p.policy}" [${p.cmd}] ${permissiveLabel(p)}`)
+    }
+  } else {
+    console.log(`${GREEN}✓ No permissive (always-true) policies found.${RESET}`)
+  }
+
+  // Allowed policies — surfaced so nobody forgets what was waved through.
+  if (result.allowed.length) {
+    console.log(
+      `${DIM}ℹ ${result.allowed.length} permissive policy(ies) allowed by config: ${result.allowed
+        .map((p) => p.policy)
+        .join(', ')}${RESET}`
+    )
+  }
+
+  if (result.passed) {
+    console.log(`\n${GREEN}RLS audit passed.${RESET}`)
+  } else {
+    console.log(`\n${RED}RLS audit failed: ${result.problems} issue(s) found.${RESET}`)
+  }
+}
+
+async function main() {
+  const opts = parseArgs(process.argv.slice(2))
+
+  if (opts.help) {
+    console.log(HELP)
+    return 0
+  }
+  if (opts.version) {
+    console.log(await readVersion())
+    return 0
+  }
+  if (!opts.dbUrl) {
+    console.error('Missing database URL. Set SUPABASE_DB_URL or pass it as the first argument.')
+    console.error('Run `airlock --help` for usage.')
+    return 2
+  }
+
+  const result = await audit({ dbUrl: opts.dbUrl, schema: opts.schema, allow: opts.allow })
+
+  if (opts.json) {
+    console.log(JSON.stringify(result, null, 2))
+  } else {
+    report(result)
+  }
+
+  return result.passed ? 0 : 1
+}
+
+main()
+  .then((code) => process.exit(code))
+  .catch((err) => {
+    // Connection failures, bad args, etc. — never a false "pass".
+    console.error(err instanceof UsageError ? `${err.message}\nRun \`airlock --help\`.` : err.message)
+    process.exit(2)
+  })

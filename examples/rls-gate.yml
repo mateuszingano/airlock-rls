@@ -1,0 +1,30 @@
+# Example workflow — drop this in your repo at .github/workflows/rls-gate.yml
+#
+# It runs the Airlock gate on every push and pull request. If a table ships
+# without RLS, or a policy is permissive (USING (true)), the job fails and the
+# merge is blocked.
+#
+# Setup (once):
+#   1. Add your Supabase Postgres connection string as a repo secret named
+#      SUPABASE_DB_URL  (Settings → Secrets and variables → Actions).
+#      Use a read-only / least-privilege role — the audit only needs to read
+#      pg_tables and pg_policies.
+#   2. Replace SEU_USUARIO/airlock@v1 with the published action reference.
+
+name: RLS Gate
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rls-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Airlock — RLS CI Gate
+        uses: SEU_USUARIO/airlock@v1
+        with:
+          db-url: ${{ secrets.SUPABASE_DB_URL }}
+          # Optional — policies that are permissive on purpose:
+          # allow: public_read,status_select
+          # schema: public

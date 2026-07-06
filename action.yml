@@ -1,0 +1,45 @@
+name: 'Airlock RLS — CI Gate for Supabase'
+description: 'Fails the build when a table ships without RLS or a policy is permissive (USING (true)). The gate scanners do not have.'
+author: 'ZINGUI'
+
+# Marketplace branding — GitHub only allows a fixed icon set + color palette.
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  db-url:
+    description: 'Postgres connection string for the Supabase project to audit. Store it as a repo secret and pass it here.'
+    required: true
+  allow:
+    description: 'Comma-separated policy names that are intentionally permissive (e.g. a public status page). These will not fail the gate.'
+    required: false
+    default: ''
+  schema:
+    description: 'Schema to audit.'
+    required: false
+    default: 'public'
+  node-version:
+    description: 'Node.js version used to run the audit.'
+    required: false
+    default: '20'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Install audit dependencies
+      shell: bash
+      working-directory: ${{ github.action_path }}
+      run: npm install --omit=dev --no-audit --no-fund
+
+    - name: Run RLS audit (the gate)
+      shell: bash
+      run: node "${{ github.action_path }}/bin/airlock.mjs" --schema "${{ inputs.schema }}"
+      env:
+        SUPABASE_DB_URL: ${{ inputs.db-url }}
+        RLS_AUDIT_ALLOW: ${{ inputs.allow }}

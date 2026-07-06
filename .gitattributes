@@ -1,0 +1,2 @@
+# Keep line endings LF across platforms — this runs on Linux CI.
+* text=auto eol=lf

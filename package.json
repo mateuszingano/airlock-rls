@@ -1,0 +1,39 @@
+{
+  "name": "airlock-rls",
+  "version": "0.1.0",
+  "description": "The CI gate for Supabase RLS. Fails your build if a table ships without Row Level Security or a policy is permissive (USING (true)).",
+  "type": "module",
+  "bin": {
+    "airlock": "./bin/airlock.mjs"
+  },
+  "exports": {
+    ".": "./src/audit.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node bin/airlock.mjs",
+    "test": "node --test"
+  },
+  "keywords": [
+    "supabase",
+    "postgres",
+    "rls",
+    "row-level-security",
+    "security",
+    "ci",
+    "ci-gate",
+    "github-action"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "pg": "^8.13.0"
+  }
+}
