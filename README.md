@@ -1,5 +1,8 @@
 # Airlock RLS — the CI gate for Supabase
 
+[![test](https://github.com/mateuszingano/airlock-rls/actions/workflows/test.yml/badge.svg)](https://github.com/mateuszingano/airlock-rls/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
 > **Scanners check that a policy exists. Airlock proves it works — and blocks the merge if it doesn't.**
 
 Airlock fails your CI when a table ships without Row Level Security, or when a
