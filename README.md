@@ -43,7 +43,7 @@ jobs:
   rls-gate:
     runs-on: ubuntu-latest
     steps:
-      - uses: SEU_USUARIO/airlock@v1
+      - uses: mateuszingano/airlock-rls@v1
         with:
           db-url: ${{ secrets.SUPABASE_DB_URL }}
           # allow: public_read,status_select   # optional

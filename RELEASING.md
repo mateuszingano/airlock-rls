@@ -28,7 +28,7 @@ git tag -f v1 v0.1.0
 git push origin v1 --force
 ```
 
-- Consumers reference `SEU_USUARIO/airlock@v1` (recommended) or pin exact `@v0.1.0`.
+- Consumers reference `mateuszingano/airlock-rls@v1` (recommended) or pin exact `@v0.1.0`.
 - **Breaking change** → bump the major and start a new floating tag (`v2`).
   Never repoint `v1` at a breaking commit.
 - Keep the `version` in `package.json` in lockstep with the tag.
