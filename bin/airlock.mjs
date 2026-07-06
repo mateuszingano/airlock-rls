@@ -21,6 +21,7 @@
 
 import { audit } from '../src/audit.mjs'
 import { probeAnonReads } from '../src/dast.mjs'
+import { fuse, extractTable } from '../src/fuse.mjs'
 
 const RESET = '\x1b[0m'
 const RED = '\x1b[31m'
@@ -165,22 +166,21 @@ async function main() {
     return 2
   }
 
-  const result = await audit({ dbUrl: opts.dbUrl, schema: opts.schema, allow: opts.allow })
+  let result = await audit({ dbUrl: opts.dbUrl, schema: opts.schema, allow: opts.allow })
 
-  // DAST pass: prove exposure with the anon key against the tables we just found.
+  // DAST pass: prove exposure with the anon key, then FUSE it with the static
+  // findings so every verdict is backed by evidence (and false positives die).
   if (opts.url && opts.anonKey) {
     const { findings } = await probeAnonReads({
       projectUrl: opts.url,
       anonKey: opts.anonKey,
       tables: result.tables,
     })
-    const fresh = findings.filter((f) => !opts.allow.includes(f.object))
-    result.findings.push(...fresh)
-    result.findings.sort((a, b) => (a.severity === b.severity ? 0 : a.severity === 'fail' ? -1 : 1))
-    result.problems = result.findings.filter((f) => f.severity === 'fail').length
-    result.warnings = result.findings.filter((f) => f.severity === 'warn').length
-    result.passed = result.problems === 0
-    result.dast = { probed: result.tables.length }
+    // Tables whose static finding was intentionally allow-listed → their DAST
+    // read is intentional too, so don't count it as a leak.
+    const allowedTables = new Set(result.allowed.map(extractTable).filter(Boolean))
+    const leakTables = findings.map((f) => f.object).filter((t) => !allowedTables.has(t))
+    result = fuse(result, { leakTables, probed: result.tables })
   }
 
   if (opts.json) {

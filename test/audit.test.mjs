@@ -9,6 +9,7 @@ const policy = (over) => ({
   roles: ['authenticated'],
   qual: null,
   with_check: null,
+  permissive: 'PERMISSIVE',
   ...over,
 })
 
@@ -145,4 +146,48 @@ test('coverage: a security_invoker view is NOT flagged', () => {
 test('result carries the full table list (for the DAST pass)', () => {
   const r = buildResult({ schema: 'public', allTables: [{ tablename: 'a' }, { tablename: 'b' }] })
   assert.deepEqual(r.tables, ['a', 'b'])
+})
+
+// --- correctness: RESTRICTIVE policies + GRANTs ---
+
+test('correctness: a RESTRICTIVE USING(true) never leaks (it only narrows)', () => {
+  const r = buildResult({ schema: 'public', policies: [policy({ roles: ['anon'], qual: 'true', permissive: 'RESTRICTIVE' })] })
+  assert.equal(r.findings.length, 0)
+})
+
+test('correctness: no GRANT to anon → a permissive USING(true) is NOT a leak', () => {
+  const r = buildResult({
+    schema: 'public',
+    policies: [policy({ roles: ['anon'], qual: 'true' })],
+    grants: [], // grants were read; anon holds none on table "t"
+  })
+  assert.equal(r.problems, 0)
+  assert.equal(r.findings.length, 0)
+})
+
+test('correctness: WITH the SELECT grant, the same policy IS a leak', () => {
+  const r = buildResult({
+    schema: 'public',
+    policies: [policy({ roles: ['anon'], qual: 'true' })],
+    grants: [{ table_name: 't', grantee: 'anon', privilege_type: 'SELECT' }],
+  })
+  assert.deepEqual(kinds(r), ['permissive_true'])
+  assert.equal(r.problems, 1)
+})
+
+test('correctness: a restrictive scoping policy downgrades a permissive leak to warn', () => {
+  const r = buildResult({
+    schema: 'public',
+    policies: [
+      policy({ policyname: 'open', roles: ['anon'], qual: 'true' }),
+      policy({ policyname: 'scope', roles: ['anon'], qual: '(auth.uid() = owner)', permissive: 'RESTRICTIVE' }),
+    ],
+  })
+  assert.equal(r.problems, 0) // the restrictive scope neutralises the open policy
+  assert.equal(r.warnings, 1)
+})
+
+test('correctness: unknown grants (null) assume granted — no false negative', () => {
+  const r = buildResult({ schema: 'public', policies: [policy({ roles: ['anon'], qual: 'true' })] })
+  assert.equal(r.problems, 1) // grants not provided → still flagged
 })

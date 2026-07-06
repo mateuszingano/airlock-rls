@@ -40,55 +40,107 @@ function includesAuthenticated(roles = []) {
   return roles.includes('authenticated') || roles.includes('public')
 }
 
+const READ_CMDS = new Set(['SELECT', 'ALL'])
+const WRITE_CMDS = new Set(['INSERT', 'UPDATE', 'ALL'])
+
+function isRestrictive(p) {
+  return String(p.permissive).toUpperCase() === 'RESTRICTIVE'
+}
+
 /**
- * Classify a single policy row into zero or more findings. Pure.
- * @param {{tablename:string, policyname:string, cmd:string, roles:string[], qual:string|null, with_check:string|null}} p
+ * Does `role` actually hold `priv` on this table? grants is
+ * { anon: Set<priv>, authenticated: Set<priv> } or null (unknown → assume yes,
+ * to avoid false negatives when we couldn't read grants).
+ */
+function hasGrant(grants, role, priv) {
+  if (!grants) return true
+  const set = grants[role]
+  return set ? set.has(priv) : false
+}
+
+/**
+ * Is there a RESTRICTIVE policy on this table that scopes the same command for
+ * this role to the current user? A restrictive scope neutralises a permissive
+ * leak (Postgres ANDs restrictive policies in), so we downgrade fail → warn.
+ */
+function restrictiveScopes(restrictives, cmd, role) {
+  return restrictives.some(
+    (r) =>
+      (r.cmd === cmd || r.cmd === 'ALL' || cmd === 'ALL') &&
+      (r.roles.includes(role) || r.roles.includes('public')) &&
+      r.qual != null &&
+      SCOPED_RE.test(r.qual)
+  )
+}
+
+/**
+ * Classify one PERMISSIVE policy into zero or more findings, aware of table
+ * GRANTs and any RESTRICTIVE policies on the same table.
+ *
+ * @param {object} p     policy row (tablename, policyname, cmd, roles[], qual, with_check, permissive)
+ * @param {object} [ctx] { grants: {anon,authenticated}|null, restrictives: policy[] }
  * @returns {Finding[]}
  */
-export function classifyPolicy(p) {
+export function classifyPolicy(p, ctx = {}) {
+  const { grants = null, restrictives = [] } = ctx
+  // A RESTRICTIVE policy only narrows access — it can never be the cause of a leak.
+  if (isRestrictive(p)) return []
+
   const object = `${p.tablename}."${p.policyname}"`
   const out = []
-
-  // 1) Literal always-true — dominant, don't double-flag.
-  if (p.qual === 'true' || p.with_check === 'true') {
-    const how = [p.qual === 'true' ? 'USING(true)' : null, p.with_check === 'true' ? 'WITH CHECK(true)' : null]
-      .filter(Boolean)
-      .join(' + ')
-    out.push({ kind: 'permissive_true', severity: 'fail', object, detail: `[${p.cmd}] ${how}` })
-    return out
-  }
-
-  const readish = p.cmd === 'SELECT' || p.cmd === 'ALL'
-  const writeish = p.cmd === 'INSERT' || p.cmd === 'UPDATE' || p.cmd === 'ALL'
   const scoped = p.qual != null && SCOPED_RE.test(p.qual)
+  const readish = READ_CMDS.has(p.cmd)
+  const writeish = WRITE_CMDS.has(p.cmd)
 
-  // 2) A read policy that doesn't scope to the current user (no auth.uid()).
-  if (readish && p.qual != null && !scoped) {
-    if (includesAnon(p.roles)) {
+  // Which roles this policy actually exposes for reads/writes (role applies AND
+  // the role holds the matching table GRANT — no grant means no exposure).
+  const anonRead = includesAnon(p.roles) && hasGrant(grants, 'anon', 'SELECT')
+  const authRead = includesAuthenticated(p.roles) && hasGrant(grants, 'authenticated', 'SELECT')
+  const writePriv = p.cmd === 'UPDATE' ? 'UPDATE' : 'INSERT'
+  const anonWrite = includesAnon(p.roles) && hasGrant(grants, 'anon', writePriv)
+  const authWrite = includesAuthenticated(p.roles) && hasGrant(grants, 'authenticated', writePriv)
+
+  // 1) Read side.
+  if (readish && (p.qual === 'true' || (p.qual != null && !scoped))) {
+    const literal = p.qual === 'true'
+    if (anonRead) {
+      const saved = restrictiveScopes(restrictives, p.cmd, 'anon')
       out.push({
-        kind: 'anon_unscoped',
-        severity: 'fail',
+        kind: literal ? 'permissive_true' : 'anon_unscoped',
+        severity: saved ? 'warn' : 'fail',
         object,
-        detail: `[${p.cmd}] anon can read rows without scoping to a user — USING (${short(p.qual)})`,
+        detail: literal
+          ? `[${p.cmd}] USING(true) — anon reads every row${saved ? ' (a restrictive policy narrows it — verify)' : ''}`
+          : `[${p.cmd}] anon reads without scoping to a user — USING (${short(p.qual)})${saved ? ' (restrictive-narrowed — verify)' : ''}`,
       })
-    } else if (includesAuthenticated(p.roles)) {
+    } else if (authRead) {
       out.push({
-        kind: 'authenticated_unscoped',
+        kind: literal ? 'permissive_true' : 'authenticated_unscoped',
         severity: 'warn',
         object,
-        detail: `[${p.cmd}] any authenticated user reads all rows (no auth.uid()) — USING (${short(p.qual)})`,
+        detail: `[${p.cmd}] any authenticated user reads all rows${literal ? ' — USING(true)' : ` (no auth.uid()) — USING (${short(p.qual)})`}`,
       })
     }
   }
 
-  // 3) A write policy with no WITH CHECK guard.
-  if (writeish && (p.with_check == null || p.with_check === '')) {
-    out.push({
-      kind: 'write_unchecked',
-      severity: 'warn',
-      object,
-      detail: `[${p.cmd}] no WITH CHECK — writes are not guarded (a row can be created/moved across the tenant line)`,
-    })
+  // 2) Write side — WITH CHECK(true) or missing check, but only if a role can write.
+  if (writeish && (anonWrite || authWrite)) {
+    if (p.with_check === 'true') {
+      const saved = restrictiveScopes(restrictives, p.cmd, anonWrite ? 'anon' : 'authenticated')
+      out.push({
+        kind: 'permissive_true',
+        severity: saved ? 'warn' : 'fail',
+        object,
+        detail: `[${p.cmd}] WITH CHECK(true) — writes are not tied to the caller (a row can be forged as anyone)${saved ? ' (restrictive-narrowed — verify)' : ''}`,
+      })
+    } else if (p.with_check == null || p.with_check === '') {
+      out.push({
+        kind: 'write_unchecked',
+        severity: 'warn',
+        object,
+        detail: `[${p.cmd}] no WITH CHECK — writes are not guarded (a row can be created/moved across the tenant line)`,
+      })
+    }
   }
 
   return out
@@ -118,9 +170,31 @@ export function buildResult({
   publicBuckets = [],
   secDefFns = [],
   views = [],
+  grants = null,
   allow = new Set(),
 } = {}) {
   const allowSet = allow instanceof Set ? allow : new Set(allow)
+
+  // Grants map (only if grant data was provided). Absent → classifyPolicy assumes
+  // granted, to avoid false negatives when we couldn't read privileges.
+  let grantsByTable = null
+  if (grants) {
+    grantsByTable = {}
+    for (const g of grants) {
+      const t = grantsByTable[g.table_name] || (grantsByTable[g.table_name] = { anon: new Set(), authenticated: new Set() })
+      if (t[g.grantee]) t[g.grantee].add(g.privilege_type)
+    }
+  }
+  const grantsFor = (table) =>
+    grantsByTable ? grantsByTable[table] || { anon: new Set(), authenticated: new Set() } : null
+
+  // Restrictive policies per table (context for neutralising permissive leaks).
+  const restrictivesByTable = {}
+  for (const p of policies) {
+    if (String(p.permissive).toUpperCase() === 'RESTRICTIVE') {
+      ;(restrictivesByTable[p.tablename] = restrictivesByTable[p.tablename] || []).push(p)
+    }
+  }
 
   const findings = []
   for (const t of noRls) {
@@ -134,7 +208,8 @@ export function buildResult({
 
   const allowed = []
   for (const p of policies) {
-    for (const f of classifyPolicy(p)) {
+    const ctx = { grants: grantsFor(p.tablename), restrictives: restrictivesByTable[p.tablename] || [] }
+    for (const f of classifyPolicy(p, ctx)) {
       if (allowSet.has(p.policyname)) allowed.push(f)
       else findings.push(f)
     }
@@ -212,9 +287,16 @@ export async function audit({ dbUrl, schema = 'public', allow = [] } = {}) {
       [schema]
     )
     const { rows: policies } = await client.query(
-      `select tablename, policyname, cmd, roles, qual, with_check
+      `select tablename, policyname, cmd, roles, qual, with_check, permissive
          from pg_policies where schemaname = $1
         order by tablename, policyname`,
+      [schema]
+    )
+    // Table GRANTs for anon/authenticated — RLS only matters where a grant exists.
+    const { rows: grants } = await client.query(
+      `select table_name, grantee, privilege_type
+         from information_schema.role_table_grants
+        where table_schema = $1 and grantee in ('anon','authenticated')`,
       [schema]
     )
     const { rows: allTables } = await client.query(
@@ -249,7 +331,7 @@ export async function audit({ dbUrl, schema = 'public', allow = [] } = {}) {
     } catch {
       publicBuckets = [] // no storage schema (not a Supabase DB) — skip
     }
-    return buildResult({ schema, noRls, policies, allTables, publicBuckets, secDefFns, views, allow })
+    return buildResult({ schema, noRls, policies, allTables, publicBuckets, secDefFns, views, grants, allow })
   } finally {
     await client.end()
   }
