@@ -146,12 +146,15 @@ export function classifyPolicy(p, ctx = {}) {
         object,
         detail: `[${p.cmd}] WITH CHECK(true) — writes are not tied to the caller (a row can be forged as anyone)${saved ? ' (restrictive-narrowed — verify)' : ''}`,
       })
-    } else if (p.with_check == null || p.with_check === '') {
+    } else if ((p.with_check == null || p.with_check === '') && !scoped && p.qual !== 'true') {
+      // When WITH CHECK is omitted, Postgres uses the USING expression as the
+      // check for new/updated rows. So this is only an unguarded write when
+      // USING doesn't scope (and isn't the literal-true case, already flagged).
       out.push({
         kind: 'write_unchecked',
         severity: 'warn',
         object,
-        detail: `[${p.cmd}] no WITH CHECK — writes are not guarded (a row can be created/moved across the tenant line)`,
+        detail: `[${p.cmd}] no WITH CHECK and USING doesn't scope to the caller — writes aren't tied to the tenant`,
       })
     }
   }

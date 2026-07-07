@@ -235,6 +235,16 @@ test('isScoped: recognises real Supabase scoping patterns (from the Zingui dogfo
   assert.equal(isScoped(null), false)
 })
 
+test('an ALL policy with a scoped USING and no WITH CHECK is NOT write_unchecked (USING guards the write)', () => {
+  // The Zingui pattern: [ALL] USING (familia_id = get_familia_id_do_user()), no WITH CHECK.
+  // Postgres uses USING as the check, so the write IS scoped.
+  const r = buildResult({
+    schema: 'public',
+    policies: [policy({ tablename: 'lancamentos', roles: ['authenticated'], cmd: 'ALL', qual: '(familia_id = get_familia_id_do_user())', with_check: null })],
+  })
+  assert.ok(!kinds(r).includes('write_unchecked'))
+})
+
 test('a service_role-only policy is NOT flagged as an anon leak', () => {
   const r = buildResult({
     schema: 'public',
