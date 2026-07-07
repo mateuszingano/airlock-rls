@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildResult, classifyPolicy } from '../src/audit.mjs'
+import { buildResult, classifyPolicy, isScoped } from '../src/audit.mjs'
 
 const policy = (over) => ({
   tablename: 't',
@@ -194,10 +194,11 @@ test('correctness: unknown grants (null) assume granted — no false negative', 
 
 // --- item 3: completeness ---
 
-test('a SECURITY DEFINER function anon can EXECUTE is a fail', () => {
+test('a SECURITY DEFINER function anon can EXECUTE is a warning (RLS helpers are legit)', () => {
   const r = buildResult({ schema: 'public', secDefFns: [{ proname: 'run_as_owner', anon_exec: true, auth_exec: true }] })
   assert.deepEqual(kinds(r), ['anon_executes_definer'])
-  assert.equal(r.problems, 1)
+  assert.equal(r.problems, 0)
+  assert.equal(r.warnings, 1)
 })
 
 test('a SECURITY DEFINER function only the owner can call is just a warning', () => {
@@ -223,6 +224,23 @@ test('a Realtime-published anon-readable table warns about change leakage', () =
   const ks = kinds(r)
   assert.ok(ks.includes('permissive_true'))
   assert.ok(ks.includes('realtime_exposure'))
+})
+
+test('isScoped: recognises real Supabase scoping patterns (from the Zingui dogfood)', () => {
+  assert.equal(isScoped('(auth.uid() = owner)'), true)
+  assert.equal(isScoped("(familia_id = get_familia_id_do_user())"), true) // helper
+  assert.equal(isScoped("(( SELECT auth.role() AS role) = 'service_role'::text)"), true) // backend-only
+  assert.equal(isScoped("(auth.role() = 'authenticated')"), false) // role-only — still flagged
+  assert.equal(isScoped("(status = 'published')"), false) // truly open
+  assert.equal(isScoped(null), false)
+})
+
+test('a service_role-only policy is NOT flagged as an anon leak', () => {
+  const r = buildResult({
+    schema: 'public',
+    policies: [policy({ tablename: 'assinaturas', roles: ['public'], cmd: 'ALL', qual: "(auth.role() = 'service_role')" })],
+  })
+  assert.ok(!kinds(r).includes('anon_unscoped'))
 })
 
 test('a Realtime table that is NOT anon-readable does not warn', () => {

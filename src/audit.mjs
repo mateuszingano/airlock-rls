@@ -30,7 +30,21 @@
  * @property {boolean} passed       problems === 0
  */
 
-const SCOPED_RE = /auth\.uid\(\)|current_setting/i
+/**
+ * Does this policy qualifier scope access (so it's not an open anon read)?
+ * Recognises the real Supabase patterns:
+ *  - per-user: auth.uid() / current_setting / auth.jwt()
+ *  - restricted to a backend role: auth.role() = 'service_role' (NOT
+ *    'authenticated'/'anon' — those stay flagged as role-only)
+ *  - scoping through a SECURITY DEFINER helper: get_/is_/has_/current_*()
+ */
+export function isScoped(qual) {
+  if (qual == null) return false
+  if (/auth\.uid\(\)|current_setting|auth\.jwt\(\)/i.test(qual)) return true
+  if (/'service_role'/i.test(qual)) return true // restricted to the backend role
+  if (/\b(get|is|has|current)_\w+\(/i.test(qual)) return true // scoping via a helper
+  return false
+}
 
 /** Roles that include the anonymous (public API) caller. */
 function includesAnon(roles = []) {
@@ -68,8 +82,7 @@ function restrictiveScopes(restrictives, cmd, role) {
     (r) =>
       (r.cmd === cmd || r.cmd === 'ALL' || cmd === 'ALL') &&
       (r.roles.includes(role) || r.roles.includes('public')) &&
-      r.qual != null &&
-      SCOPED_RE.test(r.qual)
+      isScoped(r.qual)
   )
 }
 
@@ -88,7 +101,7 @@ export function classifyPolicy(p, ctx = {}) {
 
   const object = `${p.tablename}."${p.policyname}"`
   const out = []
-  const scoped = p.qual != null && SCOPED_RE.test(p.qual)
+  const scoped = isScoped(p.qual)
   const readish = READ_CMDS.has(p.cmd)
   const writeish = WRITE_CMDS.has(p.cmd)
 
@@ -235,8 +248,11 @@ export function buildResult({
     const authExec = fn.auth_exec === true || fn.auth_exec === 'true'
     let f
     if (anonExec) {
-      f = { kind: 'anon_executes_definer', severity: 'fail', object: `fn:${fn.proname}`,
-        detail: 'anon can EXECUTE this SECURITY DEFINER function — it runs as the owner and bypasses RLS' }
+      // WARN, not fail: in Supabase, SECURITY DEFINER helper functions used
+      // inside RLS policies (and auth triggers) legitimately need anon EXECUTE.
+      // It's "review whether this one mutates/leaks", not a certain leak.
+      f = { kind: 'anon_executes_definer', severity: 'warn', object: `fn:${fn.proname}`,
+        detail: 'anon can EXECUTE this SECURITY DEFINER function (runs as owner, bypasses RLS) — fine for RLS helpers/triggers, but review any that read or mutate data' }
     } else if (authExec) {
       f = { kind: 'security_definer', severity: 'warn', object: `fn:${fn.proname}`,
         detail: 'any authenticated user can EXECUTE this SECURITY DEFINER function (runs as owner, bypasses RLS) — review' }
