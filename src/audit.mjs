@@ -329,7 +329,25 @@ export async function audit({ dbUrl, schema = 'public', allow = [] } = {}) {
   if (!dbUrl) throw new Error('Missing database URL. Set SUPABASE_DB_URL or pass one in.')
 
   const { default: pg } = await import('pg')
-  const client = new pg.Client({ connectionString: dbUrl })
+  // Supabase connections use TLS with a cert that isn't in the system CA bundle
+  // (and its default `sslmode=require` is now treated as verify-full by pg,
+  // which fails with "self-signed certificate in certificate chain"). Detect an
+  // SSL/Supabase connection and connect encrypted without cert pinning. Local
+  // plaintext connections (no sslmode, localhost) keep working untouched.
+  const usesSsl = /sslmode=(require|verify|prefer)|\.supabase\.(co|com)/i.test(dbUrl)
+  // Strip sslmode from the URL (pg would parse `require` as verify-full and fail
+  // on Supabase's cert chain) and set our own ssl config instead.
+  const cleanUrl = usesSsl
+    ? dbUrl
+        .replace(/([?&])sslmode=[^&]*/gi, '$1')
+        .replace(/\?&/g, '?')
+        .replace(/&&/g, '&')
+        .replace(/[?&]$/g, '')
+    : dbUrl
+  const client = new pg.Client({
+    connectionString: cleanUrl,
+    ...(usesSsl ? { ssl: { rejectUnauthorized: false } } : {}),
+  })
   await client.connect()
   try {
     const { rows: noRls } = await client.query(
