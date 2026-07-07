@@ -41,8 +41,8 @@ Options:
   --allow <names>    Comma-separated policy names to treat as intentionally
                      permissive (also read from $RLS_AUDIT_ALLOW).
   --schema <name>    Schema to audit (default: public).
-  --url <url>        Supabase project URL — enables the DAST pass ($SUPABASE_URL).
-  --anon-key <key>   Anon/publishable key for the DAST pass ($SUPABASE_ANON_KEY).
+  --url URL          Supabase project URL — enables the DAST pass ($SUPABASE_URL).
+  --anon-key VALUE   Public anon credential for the DAST pass. Env: SUPABASE_ANON_KEY.
   --dast-write       Also probe anonymous INSERTs (safe: an empty payload fails a
                      column constraint, revealing RLS passed without persisting).
   --json             Print the result as JSON instead of a report.
