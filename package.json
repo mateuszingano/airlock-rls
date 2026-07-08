@@ -1,6 +1,6 @@
 {
   "name": "airlock-rls",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "The CI gate for Supabase RLS. Fails your build if a table ships without Row Level Security or a policy is permissive (USING (true)).",
   "type": "module",
   "bin": {
@@ -34,6 +34,15 @@
   "engines": {
     "node": ">=18"
   },
+  "author": "Mateus Zingano",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mateuszingano/airlock-rls.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mateuszingano/airlock-rls/issues"
+  },
+  "homepage": "https://github.com/mateuszingano/airlock-rls#readme",
   "license": "MIT",
   "dependencies": {
     "pg": "^8.13.0"
