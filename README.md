@@ -136,12 +136,28 @@ import { audit } from 'airlock-rls'
 
 const result = await audit({ dbUrl: process.env.SUPABASE_DB_URL, schema: 'public' })
 if (!result.passed) {
-  console.error(`${result.problems} issue(s)`, result.tablesWithoutRls, result.permissive)
+  console.error(`${result.problems} problem(s)`)
+  for (const f of result.findings.filter((f) => f.severity === 'fail')) {
+    console.error(`  ✗ ${f.object} — ${f.detail}`)
+  }
 }
 ```
 
-`audit()` returns `{ schema, tablesWithoutRls, permissive, allowed, problems, passed }`
-and never exits the process — you decide how to report.
+`audit()` returns:
+
+```js
+{
+  schema,     // the audited schema
+  findings,   // Finding[] — { kind, severity: 'fail'|'warn', object, detail }, fail-first
+  allowed,    // Finding[] — permissive findings waved through by `allow`
+  problems,   // number of severity 'fail' findings
+  warnings,   // number of severity 'warn' findings
+  passed,     // problems === 0
+  tables,     // string[] — every table in the schema (used by the DAST pass)
+}
+```
+
+It never exits the process — you decide how to report.
 
 ---
 
