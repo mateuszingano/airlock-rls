@@ -5,6 +5,8 @@ on:
   pull_request:
 
 jobs:
+  # Unit tests — pure classifier, no database. The integration test file is
+  # gated by AIRLOCK_TEST_DB_URL and skips here, so this job stays offline.
   test:
     runs-on: ubuntu-latest
     steps:
@@ -14,3 +16,32 @@ jobs:
           node-version: '20'
       - run: npm install --no-audit --no-fund
       - run: npm test
+
+  # Integration — runs the REAL audit() against a real Postgres service
+  # container. Loads the fixtures (test/fixtures/*.sql) and asserts that a leaky
+  # schema fails and a clean one passes, end-to-end through the SQL in audit().
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        # Wait until Postgres is accepting connections before the job runs.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      AIRLOCK_TEST_DB_URL: postgresql://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install --no-audit --no-fund
+      # Only the integration file; it connects to the service container above.
+      - run: node --test test/integration.test.mjs

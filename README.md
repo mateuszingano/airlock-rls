@@ -182,6 +182,20 @@ npm start -- --help
 The audit logic (`src/audit.mjs`) is framework-free and split into a pure core
 (`buildResult`, tested without a DB) and the thin `audit()` that talks to Postgres.
 
+### Integration test (real Postgres)
+
+`test/integration.test.mjs` runs the real `audit()` against a live database using
+the fixtures in `test/fixtures/` (a leaky schema that must fail, a clean one that
+must pass). It's **gated**: with no database URL it skips, so `npm test` stays
+green offline. Point it at any Postgres to run it:
+
+```bash
+AIRLOCK_TEST_DB_URL=postgresql://postgres:postgres@127.0.0.1:5432/postgres npm test
+```
+
+In CI, the `integration` job in `.github/workflows/test.yml` stands up a Postgres
+service container and runs it automatically.
+
 ## License
 
 MIT © ZINGUI
