@@ -195,11 +195,37 @@ export function hasUnprovenOrBranch(qual) {
   return !disj.every((d) => realScope(d) || isAlwaysFalseTerm(d))
 }
 
-/** The auth/session built-ins we understand precisely (a real, visible scope). */
-function realScope(qual) {
-  if (/auth\.uid\(\)|current_setting|auth\.jwt\(\)/i.test(qual)) return true
-  if (/'service_role'/i.test(qual)) return true // restricted to the backend role
+// A token expression (auth.uid()/auth.jwt()/current_setting(...)) that is PRESENT
+// but does not RESTRICT — it holds for every caller, so it scopes nothing:
+//   `auth.uid() IS [NOT] NULL`      (true for anyone / any logged-in caller)
+//   `auth.uid() = auth.uid()`       (reflexive on the token)
+//   `auth.uid() IN (auth.uid())`    (self-membership)
+//   `auth.uid() = ANY(ARRAY[auth.uid()])`
+// realScope must reject these, or `auth.uid()=owner OR auth.uid() IS NOT NULL`
+// (every authenticated user reads the whole table) passes green — the token being
+// merely PRESENT is not proof it RESTRICTS.
+const TOKEN_EXPR = String.raw`auth\.uid\(\)|auth\.jwt\(\)|current_setting\(\s*'[^']*'\s*(?:,\s*(?:true|false)\s*)?\)`
+function isTokenTautology(qual) {
+  const s = stripOuterParens(String(qual).toLowerCase().replace(/\s+/g, ' ').trim())
+  const T = TOKEN_EXPR
+  if (new RegExp(`^(?:${T})\\s+is\\s+(?:not\\s+)?null$`).test(s)) return true
+  const eq = new RegExp(`^(${T})\\s*=\\s*(${T})$`).exec(s)
+  if (eq && eq[1] === eq[2]) return true
+  const inm = new RegExp(`^(${T})\\s+in\\s*\\(\\s*(${T})\\s*\\)$`).exec(s)
+  if (inm && inm[1] === inm[2]) return true
+  const anym = new RegExp(`^(${T})\\s*=\\s*any\\s*\\(\\s*array\\[\\s*(${T})\\s*\\]\\s*\\)$`).exec(s)
+  if (anym && anym[1] === anym[2]) return true
   return false
+}
+
+/** The auth/session built-ins we understand precisely (a real, visible scope).
+ *  Requires the token to RESTRICT (be compared to a per-row value), not merely be
+ *  present — a token-only tautology (`auth.uid() IS NOT NULL`) does not scope. */
+function realScope(qual) {
+  if (/'service_role'/i.test(qual)) return true // restricted to the backend role
+  if (!/auth\.uid\(\)|current_setting|auth\.jwt\(\)/i.test(qual)) return false
+  if (isTokenTautology(qual)) return false // present but not restrictive
+  return true
 }
 
 /**

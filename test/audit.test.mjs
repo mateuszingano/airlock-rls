@@ -56,6 +56,37 @@ test('fail-safe: an anon-reachable widening OR branch still warns (verify, not s
   assert.ok(kinds(r).includes('or_branch_unscoped'))
 })
 
+// BYPASS (re-audit → 7.5): realScope keyed on token PRESENCE, so a branch that
+// CARRIES auth.uid() but doesn't restrict (`OR auth.uid() IS NOT NULL` = every
+// logged-in user reads the whole table) passed green. realScope now requires the
+// token to RESTRICT (be compared to a per-row value), not merely appear.
+test('fail-safe: a token that is present but not restrictive still WARNs (not silent green)', () => {
+  const widen = [
+    'auth.uid() = owner OR auth.uid() is not null',   // any authenticated caller reads all
+    'auth.uid() = owner OR auth.uid() = auth.uid()',  // reflexive on the token
+    "auth.uid() = owner OR current_setting('x') = current_setting('x')",
+    'auth.uid() = owner OR auth.jwt() is not null',
+    'auth.uid() = owner OR auth.uid() = ANY(ARRAY[auth.uid()])',
+    'auth.uid() = owner OR auth.uid() in (auth.uid())',
+  ]
+  for (const qual of widen) {
+    const r = buildResult({ schema: 'public', policies: [policy({ roles: ['authenticated'], cmd: 'SELECT', qual })] })
+    assert.ok(kinds(r).includes('or_branch_unscoped'), `expected a warn for: ${qual}`)
+  }
+})
+
+test('fail-safe: a token compared to a per-row value is genuinely scoped (no false positive)', () => {
+  const scoped = [
+    'auth.uid() = owner OR is_admin(auth.uid())',
+    'owner = (select auth.uid()) OR auth.uid() = shared_with',
+    'auth.uid() = owner OR auth.uid() = ANY(collaborators)', // ANY over a column, not self
+  ]
+  for (const qual of scoped) {
+    const r = buildResult({ schema: 'public', policies: [policy({ roles: ['authenticated'], cmd: 'SELECT', qual })] })
+    assert.ok(!kinds(r).includes('or_branch_unscoped'), `did NOT expect a warn for: ${qual}`)
+  }
+})
+
 test('clean database passes', () => {
   const r = buildResult({ schema: 'public', noRls: [], policies: [] })
   assert.equal(r.passed, true)
