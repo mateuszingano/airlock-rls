@@ -60,6 +60,10 @@ function stripOuterParens(s) {
 function isAlwaysTrueTerm(term) {
   const s = stripOuterParens(term)
   if (s === 'true') return true
+  // A sub-expression that itself has a top-level OR is always-true if ANY of its
+  // disjuncts is — recurse, so a NESTED tautology like `(a OR 2=2)` is caught.
+  const disj = splitTopLevelOr(s)
+  if (disj.length > 1) return disj.some(isAlwaysTrueTerm)
   const OPERAND = "'[^']*'|[\\w.]+"
   // reflexive: same operand on both sides of `=` (covers lit=lit AND col=col)
   const refl = new RegExp(`^(${OPERAND})\\s*=\\s*(${OPERAND})$`).exec(s)
@@ -107,10 +111,9 @@ function splitTopLevelOr(q) {
  */
 export function isPermissiveTautology(qual) {
   if (qual == null) return false
-  const q = stripOuterParens(String(qual).toLowerCase().replace(/\s+/g, ' ').trim())
-  if (isAlwaysTrueTerm(q)) return true
-  const disjuncts = splitTopLevelOr(q)
-  return disjuncts.length > 1 && disjuncts.some(isAlwaysTrueTerm)
+  // isAlwaysTrueTerm handles the parens, the top-level OR split, AND the recursion
+  // into nested OR groups — one entry point covers `2=2`, `x OR 2=2`, `x OR (a OR 2=2)`.
+  return isAlwaysTrueTerm(String(qual).toLowerCase().replace(/\s+/g, ' ').trim())
 }
 
 /** The auth/session built-ins we understand precisely (a real, visible scope). */

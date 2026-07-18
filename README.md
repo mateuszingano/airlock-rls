@@ -28,10 +28,13 @@ Airlock audits the *logic* of your policies, not just their presence.
 **Fails the build (exposure):**
 1. **`rls_disabled`** — a table with RLS off; every row exposed to the API roles.
 2. **`permissive_true`** — a policy `USING (true)` / `WITH CHECK (true)`, **or one
-   that reduces to always-true**: any tautology OR-joined to the scope token
-   (`auth.uid() = x OR 2=2`, `OR 'a'='a'`, `OR 1<2`), a reflexive `owner_id =
-   owner_id`, or the bare form — the scope token is present but the row still
-   matches for everyone. (A tautology under `AND` is fine — the scope survives.)
+   that reduces to always-true**: a common tautology OR-joined to the scope token
+   (`auth.uid() = x OR 2=2`, `OR 'a'='a'`, `OR 1<2`, even nested `OR (a OR 1=1)`),
+   a reflexive `owner_id = owner_id`, or the bare form — the scope token is present
+   but the row still matches for everyone. (A tautology under `AND` is fine — the
+   scope survives.) It catches the *common* always-true shapes (literal `true`,
+   self-equality, evaluated constant comparisons); exotic forms — `NOT (1=2)`,
+   arithmetic like `1+1=2` — aren't decided here; run the DAST pass to prove those.
 3. **`anon_unscoped`** — an anon-readable policy that doesn't scope to the user
    (no `auth.uid()`) — everyone reads every row, even when it isn't literally `true`.
 4. **`write_unscoped`** — an anon INSERT/UPDATE whose `WITH CHECK` is present but

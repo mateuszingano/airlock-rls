@@ -323,6 +323,15 @@ test('isPermissiveTautology: GENERAL tautologies, not just the literal 1=1', () 
   assert.equal(isPermissiveTautology("org = 'x' OR org = 'y'"), false)
 })
 
+test('isPermissiveTautology: NESTED tautology inside a parenthesised OR group is caught', () => {
+  assert.equal(isPermissiveTautology('auth.uid() = x OR (a OR 2=2)'), true)
+  assert.equal(isPermissiveTautology('auth.uid() = x OR (foo AND bar OR 1=1)'), true)
+  assert.equal(isPermissiveTautology('((auth.uid() = owner) OR (7 = 7))'), true)
+  // nested but NOT a tautology — scope survives
+  assert.equal(isPermissiveTautology('auth.uid() = x OR (a OR b = 1)'), false)
+  assert.equal(isPermissiveTautology('auth.uid() = x OR (a AND 2=2)'), false) // AND inside → not always true
+})
+
 test('NEW Critical: OR 2=2 for anon is caught as permissive_true (FAIL)', () => {
   const r = buildResult({
     schema: 'public',
