@@ -34,8 +34,11 @@ Airlock audits the *logic* of your policies, not just their presence.
    the scope token is present but the row still matches for everyone. (A tautology
    under `AND` is fine — the scope survives.) It catches the *common* always-true
    shapes (literal `true`, self-equality, evaluated constant comparisons, a constant
-   `IN` a constant list, a non-negative built-in like `length(x) >= 0`); exotic forms —
-   `NOT (1=2)`, arithmetic like `1+1=2` — aren't decided here; run the DAST pass to prove those.
+   `IN` a constant list, a non-negative built-in like `length(x) >= 0`) as a hard
+   fail. An OR branch it *can't* prove — an exotic tautology (`NOT (1=2)`), a
+   widening predicate (`OR status = 'published'`), anything unrecognized — is not
+   passed silently: it becomes an **`or_branch_unscoped` warn** (see below), so a
+   new tautology shape never re-opens a silent hole.
 3. **`anon_unscoped`** — an anon-readable policy that doesn't scope to the user
    (no `auth.uid()`) — everyone reads every row, even when it isn't literally `true`.
 4. **`write_unscoped`** — an anon INSERT/UPDATE whose `WITH CHECK` is present but
@@ -48,6 +51,12 @@ Airlock audits the *logic* of your policies, not just their presence.
    your deployed site — no database needed (see below).
 
 **Warns (worth a review):**
+- **`or_branch_unscoped`** — the policy scopes to `auth.uid()` but an `OR` branch
+  widens it in a way a static scan can't prove restricts (`auth.uid() = owner OR
+  status = 'published'`, `OR deleted_at IS NULL`, an exotic tautology). It may be
+  intentional public sharing, or a leak — this is a **fail-safe**: unproven OR
+  branches warn instead of passing silently. Prove it with the DAST pass or
+  allow-list it if intended.
 - **`authenticated_unscoped`** — any logged-in user reads all rows (role-only check).
 - **`helper_scoped`** — a client-reachable read scoped *only* through a helper
   function of any name (`is_public()`, `authorize('posts.read')`, `belongs_to_org()`);

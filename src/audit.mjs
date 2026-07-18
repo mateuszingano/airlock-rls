@@ -156,6 +156,45 @@ export function isPermissiveTautology(qual) {
   return isAlwaysTrueTerm(String(qual).toLowerCase().replace(/\s+/g, ' ').trim())
 }
 
+/** Is this single term provably ALWAYS FALSE (`false`, `1=2`, `'a'='b'`)? Such a
+ *  term contributes nothing to an OR, so it doesn't widen access. */
+function isAlwaysFalseTerm(term) {
+  const s = stripOuterParens(term)
+  if (s === 'false') return true
+  const cmp = /^(-?\d+(?:\.\d+)?|'[^']*')\s*(=|<>|!=|<=|>=|<|>)\s*(-?\d+(?:\.\d+)?|'[^']*')$/.exec(s)
+  if (!cmp) return false
+  const [, a, op, b] = cmp
+  const aStr = a.startsWith("'"), bStr = b.startsWith("'")
+  if (aStr !== bStr) return false
+  const va = aStr ? a : parseFloat(a)
+  const vb = bStr ? b : parseFloat(b)
+  switch (op) {
+    case '=': return va !== vb
+    case '<>': case '!=': return va === vb
+    case '<': return !(va < vb)
+    case '>': return !(va > vb)
+    case '<=': return !(va <= vb)
+    case '>=': return !(va >= vb)
+    default: return false
+  }
+}
+
+/**
+ * FAIL-SAFE for the tautology hydra: a policy is "safely scoped" only if EVERY
+ * top-level OR disjunct itself restricts to the caller (realScope) or is provably
+ * false. If ANY OR branch is something the engine can't prove restricts —
+ * `auth.uid()=x OR status='published'`, `OR (1=1 AND 2=2)`, `OR deleted_at IS
+ * NULL`, `OR coalesce(true,false)` — the OR WIDENS access, so we must NOT pass it
+ * silently. Returns true → caller emits a WARN (not a silent green). This closes
+ * the whole class instead of enumerating tautology forms one by one.
+ */
+export function hasUnprovenOrBranch(qual) {
+  if (qual == null) return false
+  const disj = splitTopLevelOr(String(qual).toLowerCase().replace(/\s+/g, ' ').trim())
+  if (disj.length <= 1) return false
+  return !disj.every((d) => realScope(d) || isAlwaysFalseTerm(d))
+}
+
 /** The auth/session built-ins we understand precisely (a real, visible scope). */
 function realScope(qual) {
   if (/auth\.uid\(\)|current_setting|auth\.jwt\(\)/i.test(qual)) return true
@@ -329,6 +368,22 @@ export function classifyPolicy(p, ctx = {}) {
         detail: `[${p.cmd}] ${who} read is scoped only through ${helper}() — a static scan can't see inside it; verify it restricts the caller${prove}`,
       })
     }
+  }
+
+  // 1c) FAIL-SAFE. A real scope (auth.uid()) is present, but a top-level OR branch
+  // widens access in a way the engine can't PROVE restricts — `... OR status =
+  // 'published'`, `... OR (1=1 AND 2=2)`, `... OR deleted_at IS NULL`. This is the
+  // architecture, not another form in the denylist: any OR branch we can't prove
+  // restricts → WARN, never a silent green. (`taut` is already a fail above; a
+  // fully user-scoped OR like `auth.uid()=a OR auth.uid()=b` proves out and is quiet.)
+  if (readish && (anonRead || authRead) && !taut && scoped && hasUnprovenOrBranch(p.qual)) {
+    const who = anonRead ? 'anon' : 'any authenticated user'
+    out.push({
+      kind: 'or_branch_unscoped',
+      severity: 'warn',
+      object,
+      detail: `[${p.cmd}] scoped by auth.uid() but an OR branch widens it — ${who} may read rows outside the caller: USING (${short(p.qual)}). Prove the branch restricts (add --url/--anon-key) or allow-list if it's intentional public sharing.`,
+    })
   }
 
   // 2) Write side — WITH CHECK literal-true, tautology, present-but-unscoped, or

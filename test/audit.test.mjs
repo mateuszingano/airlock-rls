@@ -17,6 +17,45 @@ function kinds(result) {
   return result.findings.map((f) => f.kind).sort()
 }
 
+// --- FAIL-SAFE (re-audit → architecture, not form-hunting): an OR branch the
+// engine can't prove restricts must WARN, never pass silently. Closes the class:
+// even tautology forms the denylist doesn't recognize fall into the warn. ---
+test('fail-safe: an unproven OR branch next to auth.uid() WARNs (never silent green)', () => {
+  const widen = [
+    "auth.uid() = user_id OR status = 'published'",
+    'auth.uid() = user_id OR (1=1 AND 2=2)',          // AND-group tautology the denylist misses
+    'auth.uid() = user_id OR deleted_at is null OR deleted_at is not null',
+    'auth.uid() = user_id OR coalesce(true, false)',
+    'auth.uid() = user_id OR is_public()',            // helper on an OR branch widens
+  ]
+  for (const qual of widen) {
+    const r = buildResult({ schema: 'public', policies: [policy({ roles: ['authenticated'], cmd: 'SELECT', qual })] })
+    assert.ok(kinds(r).includes('or_branch_unscoped'), `expected a warn for: ${qual}`)
+    assert.equal(r.problems, 0) // it's a WARN, not a hard fail (could be intentional public sharing)
+  }
+})
+
+test('fail-safe: a fully user-scoped OR does NOT warn (no false positive)', () => {
+  const safe = [
+    'auth.uid() = owner OR auth.uid() = shared_with', // both branches user-scoped
+    '(auth.uid() = user_id)',                         // no OR at all
+    'auth.uid() = user_id OR 1=2',                    // the OR branch is provably false → contributes nothing
+    "auth.role() = 'service_role' OR auth.uid() = owner",
+  ]
+  for (const qual of safe) {
+    const r = buildResult({ schema: 'public', policies: [policy({ roles: ['authenticated'], cmd: 'SELECT', qual })] })
+    assert.ok(!kinds(r).includes('or_branch_unscoped'), `did NOT expect a warn for: ${qual}`)
+  }
+})
+
+test('fail-safe: an anon-reachable widening OR branch still warns (verify, not silent)', () => {
+  const r = buildResult({
+    schema: 'public',
+    policies: [policy({ roles: ['anon'], cmd: 'SELECT', qual: "auth.uid() = user_id OR org = 'acme'" })],
+  })
+  assert.ok(kinds(r).includes('or_branch_unscoped'))
+})
+
 test('clean database passes', () => {
   const r = buildResult({ schema: 'public', noRls: [], policies: [] })
   assert.equal(r.passed, true)
