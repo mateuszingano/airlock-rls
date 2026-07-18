@@ -55,6 +55,9 @@ function stripOuterParens(s) {
  *  - a reflexive equality — both sides the identical literal OR column:
  *    `1=1`, `2=2`, `'a'='a'`, `owner_id = owner_id`
  *  - a constant comparison that holds: `1<2`, `5>=5`, `'a'<>'b'`
+ *  - a constant IN a constant list: `1 in (1)`, `'a' in ('a','b')`
+ *  - a non-negative built-in the comparison can't falsify: `length(x) >= 0`,
+ *    `char_length(x) > -1` (these functions return an int >= 0)
  * (`1=2` and `a=b` are NOT tautologies and stay false.)
  */
 function isAlwaysTrueTerm(term) {
@@ -85,7 +88,44 @@ function isAlwaysTrueTerm(term) {
       case '>=': return va >= vb
     }
   }
+  // constant IN a constant list → always-true iff the constant is in the list:
+  //   `1 in (1)`, `1 in (1, 2)`, `'a' in ('a','b')`. A column or subquery
+  //   (`email in (select ...)`) is NOT constant, so it stays scoped/unevaluated.
+  const inm = new RegExp(`^(${OPERAND})\\s+in\\s*\\((.+)\\)$`).exec(s)
+  if (inm) {
+    const needle = inm[1]
+    const CONST = /^(-?\d+(?:\.\d+)?|'[^']*')$/
+    if (!CONST.test(needle)) return false // left side is a column — can't decide
+    const list = splitTopLevelCommas(inm[2]).map((x) => x.trim())
+    if (list.length && list.every((x) => CONST.test(x))) return list.includes(needle)
+    return false
+  }
+  // a non-negative built-in compared so the result ALWAYS satisfies it:
+  //   `length(x) >= 0`, `char_length(x) > -1`, `octet_length(x) <> -1`.
+  // These functions return an integer >= 0, so the predicate can never be false.
+  const NONNEG = 'length|char_length|character_length|octet_length|bit_length|cardinality'
+  const nn = new RegExp(`^(?:${NONNEG})\\s*\\(.*\\)\\s*(>=|>|<>|!=)\\s*(-?\\d+(?:\\.\\d+)?)$`).exec(s)
+  if (nn) {
+    const op = nn[1], n = parseFloat(nn[2])
+    if (op === '>=') return n <= 0          // r >= n holds for all r >= 0 when n <= 0
+    if (op === '>') return n < 0            // r >  n holds for all r >= 0 when n <  0
+    if (op === '<>' || op === '!=') return n < 0 // r is never negative
+  }
   return false
+}
+
+/** Split on commas at paren-depth 0 (for an `IN (a, b, c)` list). */
+function splitTopLevelCommas(q) {
+  const parts = []
+  let depth = 0
+  let last = 0
+  for (let i = 0; i < q.length; i++) {
+    if (q[i] === '(') depth++
+    else if (q[i] === ')') depth--
+    else if (depth === 0 && q[i] === ',') { parts.push(q.slice(last, i)); last = i + 1 }
+  }
+  parts.push(q.slice(last))
+  return parts
 }
 
 /** Split a boolean expression on `OR` at paren-depth 0. */
@@ -133,7 +173,14 @@ function realScope(qual) {
  */
 function helperCall(qual) {
   const re = /\b((?:\w+\.)?\w+)\s*\(/g
-  const skip = new Set(['auth.uid', 'auth.jwt', 'auth.role', 'current_setting', 'select', 'exists'])
+  // Ignore the built-ins we handle precisely, the SQL keywords that take parens
+  // (select/exists subqueries, the `in (…)` operator), and non-negative scalar
+  // built-ins that only appear inside constant/tautological predicates — none of
+  // these scope a row to the caller, so they must not read as a "real" helper.
+  const skip = new Set([
+    'auth.uid', 'auth.jwt', 'auth.role', 'current_setting', 'select', 'exists', 'in',
+    'length', 'char_length', 'character_length', 'octet_length', 'bit_length', 'cardinality',
+  ])
   let m
   while ((m = re.exec(qual)) !== null) {
     if (!skip.has(m[1].toLowerCase())) return m[1]

@@ -332,6 +332,71 @@ test('isPermissiveTautology: NESTED tautology inside a parenthesised OR group is
   assert.equal(isPermissiveTautology('auth.uid() = x OR (a AND 2=2)'), false) // AND inside → not always true
 })
 
+test('isPermissiveTautology: a constant IN a constant list is always-true', () => {
+  // bare and OR-joined to a scope token — both neutralise the scope
+  assert.equal(isPermissiveTautology('1 IN (1)'), true)
+  assert.equal(isPermissiveTautology('auth.uid() = owner OR 1 IN (1)'), true)
+  assert.equal(isPermissiveTautology('1 IN (1, 2)'), true)          // needle present in list
+  assert.equal(isPermissiveTautology("'a' IN ('a','b')"), true)
+  assert.equal(isPermissiveTautology('auth.uid() = x OR (a OR 1 IN (1))'), true) // nested
+  // NOT tautologies — must stay false
+  assert.equal(isPermissiveTautology('1 IN (2, 3)'), false)         // needle absent
+  assert.equal(isPermissiveTautology('org_id IN (1, 2)'), false)    // left is a column
+  assert.equal(isPermissiveTautology('auth.uid() = owner AND 1 IN (1)'), false) // AND: scope holds
+  // a real subquery scope (email IN (select … where user_id = auth.uid())) must survive
+  assert.equal(
+    isScoped('email IN (SELECT email FROM membros WHERE membros.user_id = auth.uid())'),
+    true
+  )
+})
+
+test('isPermissiveTautology: a non-negative built-in >= 0 is always-true', () => {
+  assert.equal(isPermissiveTautology('length(x) >= 0'), true)
+  assert.equal(isPermissiveTautology('auth.uid() = owner OR length(secret) >= 0'), true)
+  assert.equal(isPermissiveTautology('char_length(name) > -1'), true)
+  assert.equal(isPermissiveTautology('octet_length(x) <> -1'), true)
+  assert.equal(isPermissiveTautology('auth.uid() = x OR (a OR length(y) >= 0)'), true) // nested
+  // real length FILTERS are NOT always-true — must stay false
+  assert.equal(isPermissiveTautology('length(x) >= 5'), false)
+  assert.equal(isPermissiveTautology('length(x) > 0'), false)       // empty string is length 0
+  assert.equal(isPermissiveTautology('auth.uid() = owner AND length(x) >= 0'), false) // AND: scope holds
+})
+
+test('classifyPolicy: nested/IN/length tautologies for anon → permissive_true (FAIL)', () => {
+  for (const qual of [
+    'auth.uid() = user_id OR (a=b OR 2=2)', // nested OR
+    'auth.uid() = user_id OR 1 IN (1)',     // constant IN
+    'auth.uid() = user_id OR length(x) >= 0', // non-negative built-in
+  ]) {
+    const r = buildResult({
+      schema: 'public',
+      policies: [policy({ roles: ['anon'], cmd: 'SELECT', qual })],
+    })
+    assert.deepEqual(kinds(r), ['permissive_true'], `qual should FAIL: ${qual}`)
+    assert.equal(r.problems, 1, `qual should be 1 problem: ${qual}`)
+    assert.equal(r.passed, false)
+  }
+})
+
+test('classifyPolicy: a legitimately scoped policy is NOT flagged (no false positive)', () => {
+  // the fix must not regress real per-user / helper scopes
+  for (const qual of [
+    '(auth.uid() = user_id)',
+    'belongs_to_org(org_id)',        // still a helper_scoped warn, never a false FAIL
+    '(email IN ( SELECT tickets.email FROM membros WHERE (membros.user_id = ( SELECT auth.uid()))))',
+  ]) {
+    const r = buildResult({
+      schema: 'public',
+      policies: [policy({ roles: ['anon'], cmd: 'SELECT', qual })],
+    })
+    assert.equal(r.problems, 0, `qual must not FAIL: ${qual}`)
+    assert.ok(
+      !kinds(r).includes('permissive_true') && !kinds(r).includes('anon_unscoped'),
+      `qual must not be flagged as exposed: ${qual}`
+    )
+  }
+})
+
 test('NEW Critical: OR 2=2 for anon is caught as permissive_true (FAIL)', () => {
   const r = buildResult({
     schema: 'public',
