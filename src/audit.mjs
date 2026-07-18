@@ -30,27 +30,87 @@
  * @property {boolean} passed       problems === 0
  */
 
+/** Strip one or more fully-enclosing paren pairs: "((x))" → "x". */
+function stripOuterParens(s) {
+  s = s.trim()
+  while (s.startsWith('(') && s.endsWith(')')) {
+    let depth = 0
+    let matches = true
+    for (let i = 0; i < s.length; i++) {
+      if (s[i] === '(') depth++
+      else if (s[i] === ')') {
+        depth--
+        if (depth === 0 && i < s.length - 1) { matches = false; break }
+      }
+    }
+    if (matches) s = s.slice(1, -1).trim()
+    else break
+  }
+  return s
+}
+
 /**
- * Does this qualifier always evaluate true, so it can't scope anything?
- * Catches the two ways a scope token gets neutralised:
- *  - an OR-joined literal-true disjunct: `auth.uid() = owner OR true`, `... OR 1=1`
- *    (the scoped part is present but irrelevant — the whole expression is true)
- *  - a bare tautology as the entire qualifier: `1=1`, `'x'='x'`, `(true)`
- * A permissive policy whose qual is a tautology is as open as USING(true).
+ * Is this single boolean term ALWAYS true, so it can't scope anything?
+ *  - the literal `true`
+ *  - a reflexive equality — both sides the identical literal OR column:
+ *    `1=1`, `2=2`, `'a'='a'`, `owner_id = owner_id`
+ *  - a constant comparison that holds: `1<2`, `5>=5`, `'a'<>'b'`
+ * (`1=2` and `a=b` are NOT tautologies and stay false.)
+ */
+function isAlwaysTrueTerm(term) {
+  const s = stripOuterParens(term)
+  if (s === 'true') return true
+  const OPERAND = "'[^']*'|[\\w.]+"
+  // reflexive: same operand on both sides of `=` (covers lit=lit AND col=col)
+  const refl = new RegExp(`^(${OPERAND})\\s*=\\s*(${OPERAND})$`).exec(s)
+  if (refl && refl[1] === refl[2]) return true
+  // constant OP constant → evaluate (both sides number, or both string)
+  const cmp = new RegExp(`^(-?\\d+(?:\\.\\d+)?|'[^']*')\\s*(=|<>|!=|<=|>=|<|>)\\s*(-?\\d+(?:\\.\\d+)?|'[^']*')$`).exec(s)
+  if (cmp) {
+    const [, a, op, b] = cmp
+    const aStr = a.startsWith("'"), bStr = b.startsWith("'")
+    if (aStr !== bStr) return false // mixed types — don't guess
+    const va = aStr ? a : parseFloat(a)
+    const vb = bStr ? b : parseFloat(b)
+    switch (op) {
+      case '=': return va === vb
+      case '<>': case '!=': return va !== vb
+      case '<': return va < vb
+      case '>': return va > vb
+      case '<=': return va <= vb
+      case '>=': return va >= vb
+    }
+  }
+  return false
+}
+
+/** Split a boolean expression on `OR` at paren-depth 0. */
+function splitTopLevelOr(q) {
+  const parts = []
+  let depth = 0
+  let last = 0
+  for (let i = 0; i < q.length; i++) {
+    if (q[i] === '(') depth++
+    else if (q[i] === ')') depth--
+    else if (depth === 0 && q.startsWith(' or ', i)) { parts.push(q.slice(last, i)); i += 3; last = i + 1 }
+  }
+  parts.push(q.slice(last))
+  return parts.map((p) => p.trim())
+}
+
+/**
+ * Does this qualifier always evaluate true, so it can't scope anything? A scope
+ * token is neutralised when a tautology is OR-joined to it (`auth.uid() = owner
+ * OR 2=2`) or IS the whole qualifier (`1=1`, `(true)`, `owner_id = owner_id`).
+ * A tautology joined only by AND does NOT neutralise the scope, so we only look
+ * at top-level OR disjuncts (and the whole expression).
  */
 export function isPermissiveTautology(qual) {
   if (qual == null) return false
-  const q = String(qual).toLowerCase()
-  const padded = ` ${q.replace(/\s+/g, ' ')} `
-  // OR-joined literal-true disjunct (optional surrounding parens on the literal)
-  if (/\bor\s+\(*\s*true\b/.test(padded) || /\btrue\s*\)*\s+or\b/.test(padded)) return true
-  if (/\bor\s+\(*\s*1\s*=\s*1\b/.test(padded) || /\b1\s*=\s*1\s*\)*\s+or\b/.test(padded)) return true
-  // bare tautology as the whole qualifier
-  const bare = q.replace(/[()\s]/g, '')
-  if (bare === 'true') return true
-  if (/^1=1$/.test(bare)) return true
-  if (/^'([^']*)'='\1'$/.test(bare)) return true
-  return false
+  const q = stripOuterParens(String(qual).toLowerCase().replace(/\s+/g, ' ').trim())
+  if (isAlwaysTrueTerm(q)) return true
+  const disjuncts = splitTopLevelOr(q)
+  return disjuncts.length > 1 && disjuncts.some(isAlwaysTrueTerm)
 }
 
 /** The auth/session built-ins we understand precisely (a real, visible scope). */

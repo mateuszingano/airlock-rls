@@ -187,7 +187,9 @@ async function main() {
     : { schema: opts.schema, findings: [], allowed: [], problems: 0, warnings: 0, passed: true, tables: [] }
 
   // DAST pass: prove exposure with the anon key, then FUSE it with the static
-  // findings so every verdict is backed by evidence (and false positives die).
+  // findings — a live read UPGRADES a static fail to "confirmed" and surfaces
+  // leaks static missed. Reading nothing does NOT downgrade a fail (an empty
+  // table is a latent leak, not a false positive — never trade a false negative).
   if (opts.dbUrl && opts.url && opts.anonKey) {
     const { findings } = await probeAnonReads({
       projectUrl: opts.url,

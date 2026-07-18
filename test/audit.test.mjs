@@ -305,6 +305,41 @@ test('isPermissiveTautology: catches OR-true, OR 1=1, and bare tautologies', () 
   assert.equal(isPermissiveTautology('a = 1 OR b = 1'), false)
 })
 
+test('isPermissiveTautology: GENERAL tautologies, not just the literal 1=1', () => {
+  // the Critical the first fix missed: any self-equality / always-true constant
+  assert.equal(isPermissiveTautology('auth.uid() = user_id OR 2=2'), true)
+  assert.equal(isPermissiveTautology('auth.uid() = owner OR 5 = 5'), true)
+  assert.equal(isPermissiveTautology('owner_id = owner_id'), true) // col=col never scopes
+  assert.equal(isPermissiveTautology('x OR 0 = 0'), true)
+  assert.equal(isPermissiveTautology('scope OR 1 < 2'), true)
+  assert.equal(isPermissiveTautology('scope OR 5 >= 5'), true)
+  assert.equal(isPermissiveTautology("scope OR 'a' <> 'b'"), true)
+  assert.equal(isPermissiveTautology('(( auth.uid() = owner OR 42 = 42 ))'), true) // nested parens
+  // NOT tautologies — must stay false
+  assert.equal(isPermissiveTautology('a = 1 OR b = 2'), false)
+  assert.equal(isPermissiveTautology('x OR 1 = 2'), false) // constant FALSE disjunct
+  assert.equal(isPermissiveTautology('owner_id = tenant_id'), false) // different columns
+  assert.equal(isPermissiveTautology('auth.uid() = owner AND 1=1'), false) // AND: scope survives
+  assert.equal(isPermissiveTautology("org = 'x' OR org = 'y'"), false)
+})
+
+test('NEW Critical: OR 2=2 for anon is caught as permissive_true (FAIL)', () => {
+  const r = buildResult({
+    schema: 'public',
+    policies: [policy({ roles: ['anon'], cmd: 'SELECT', qual: 'auth.uid() = user_id OR 2=2' })],
+  })
+  assert.deepEqual(kinds(r), ['permissive_true'])
+  assert.equal(r.problems, 1)
+})
+
+test('a tautology under AND does NOT get flagged (the scope still holds)', () => {
+  const r = buildResult({
+    schema: 'public',
+    policies: [policy({ roles: ['anon'], cmd: 'SELECT', qual: '(auth.uid() = user_id AND 1=1)' })],
+  })
+  assert.equal(r.findings.length, 0)
+})
+
 test('NEW #1: USING (auth.uid() = user_id OR true) for anon → permissive_true (FAIL)', () => {
   const r = buildResult({
     schema: 'public',

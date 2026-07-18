@@ -36,14 +36,16 @@ test('DAST confirms a static finding → stays fail, marked confirmed', () => {
   assert.match(r.findings[0].detail, /CONFIRMED/)
 })
 
-test('DAST reads nothing → static finding downgraded to warn (false positive killed)', () => {
+test('DAST reads nothing → stays FAIL (empty table is a latent leak, not a false positive)', () => {
   const r = fuse(staticResult([{ kind: 'anon_unscoped', severity: 'fail', object: 'drafts."pub"', detail: 'x' }]), {
     leakTables: [],
     probed: ['drafts'],
   })
-  assert.equal(r.problems, 0)
-  assert.equal(r.warnings, 1)
+  assert.equal(r.problems, 1) // NOT downgraded — an empty table with a permissive policy still leaks
+  assert.equal(r.warnings, 0)
+  assert.equal(r.findings[0].severity, 'fail')
   assert.equal(r.findings[0].verdict, 'unconfirmed')
+  assert.match(r.findings[0].detail, /latent/)
 })
 
 test('DAST leak with no static finding → added as a proven fail', () => {

@@ -41,7 +41,14 @@ export function fuse(staticResult, { leakTables = [], probed = [] } = {}) {
     if (table && leaks.has(table)) {
       fused.push({ ...f, severity: 'fail', verdict: 'confirmed', detail: `${f.detail} — CONFIRMED: DAST read real rows with the anon key` })
     } else if (table && probedSet.has(table)) {
-      fused.push({ ...f, severity: 'warn', verdict: 'unconfirmed', detail: `${f.detail} — DAST: anon read returned nothing (empty table, or blocked by a grant/restrictive)` })
+      // DAST read nothing. That is NOT proof of safety — the table may just be
+      // empty (or hold no rows matching the qual right now); the permissive policy
+      // still leaks the instant a matching row exists. So DON'T downgrade the
+      // fail (that would be a false negative, the worst failure for a security
+      // gate). Grants / RESTRICTIVE policies that truly block anon are already
+      // handled in the static pass, so a surviving static fail is real. Keep the
+      // severity; only annotate that DAST couldn't confirm it live.
+      fused.push({ ...f, verdict: 'unconfirmed', detail: `${f.detail} — DAST read no rows (table may be empty; the permissive policy is still a latent exposure)` })
     } else {
       fused.push(f) // DAST didn't probe it — no evidence either way
     }
