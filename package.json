@@ -1,14 +1,15 @@
 {
   "name": "airlock-rls",
-  "version": "0.1.2",
-  "description": "The CI gate for Supabase RLS. Fails your build if a table ships without Row Level Security or a policy is permissive (USING (true)).",
+  "version": "0.2.0",
+  "description": "The CI gate for Supabase RLS. Fails your build if a table ships without Row Level Security or a policy is permissive (USING (true)) — and scans your deployed site for an exposed service_role key.",
   "type": "module",
   "bin": {
     "airlock": "bin/airlock.mjs",
     "airlock-rls": "bin/airlock.mjs"
   },
+  "types": "./src/audit.d.ts",
   "exports": {
-    ".": "./src/audit.mjs"
+    ".": { "types": "./src/audit.d.ts", "default": "./src/audit.mjs" }
   },
   "files": [
     "bin",

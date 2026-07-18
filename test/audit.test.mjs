@@ -63,6 +63,33 @@ test('NEW: role-only check for authenticated → authenticated_unscoped (warn, n
   assert.equal(r.passed, true) // warnings alone don't fail the gate
 })
 
+test('helper-scoped anon read is a warn (static scan cannot see inside the helper)', () => {
+  const r = buildResult({
+    schema: 'public',
+    policies: [policy({ roles: ['anon'], cmd: 'SELECT', qual: 'is_public(id)' })],
+  })
+  assert.deepEqual(kinds(r), ['helper_scoped'])
+  assert.equal(r.problems, 0) // warn, not fail — it MIGHT restrict; DAST can prove it
+  assert.match(r.findings[0].detail, /anon read is scoped only through is_public\(\)/)
+})
+
+test('helper-scoped AUTHENTICATED read is also a warn (any logged-in user could read all)', () => {
+  const r = buildResult({
+    schema: 'public',
+    policies: [policy({ roles: ['authenticated'], cmd: 'SELECT', qual: 'is_admin()' })],
+  })
+  assert.deepEqual(kinds(r), ['helper_scoped'])
+  assert.match(r.findings[0].detail, /any authenticated user read is scoped only through is_admin\(\)/)
+})
+
+test('helper AND auth.uid() together → not flagged (a real scope is present)', () => {
+  const r = buildResult({
+    schema: 'public',
+    policies: [policy({ roles: ['anon'], cmd: 'SELECT', qual: 'is_x() and auth.uid() = owner' })],
+  })
+  assert.equal(r.findings.length, 0)
+})
+
 test('a properly scoped policy (auth.uid()) is NOT flagged', () => {
   const r = buildResult({
     schema: 'public',

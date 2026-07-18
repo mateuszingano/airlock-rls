@@ -32,9 +32,16 @@ Airlock audits the *logic* of your policies, not just their presence.
    (no `auth.uid()`) — everyone reads every row, even when it isn't literally `true`.
 4. **`anon_read_leak`** *(DAST)* — with an anon key, Airlock actually reads each
    table over the REST API; a returned row is a **proven** leak, not an inference.
+5. **`service_role_exposed`** — a Supabase **service key** shipped to the browser
+   (a `service_role` JWT or an `sb_secret_...` key). It bypasses *every* RLS
+   policy at once, so whoever reads it owns your database. Scanned straight from
+   your deployed site — no database needed (see below).
 
 **Warns (worth a review):**
 - **`authenticated_unscoped`** — any logged-in user reads all rows (role-only check).
+- **`helper_scoped`** — a client-reachable read scoped *only* through a helper
+  function (e.g. `is_public()`); a static scan can't see inside it, so verify it
+  actually restricts the caller (or allow-list it if intentional).
 - **`write_unchecked`** — an INSERT/UPDATE policy with no `WITH CHECK` guard.
 - **`public_bucket`** — a public storage bucket.
 - **`security_definer`** — a function that runs as its owner and can bypass RLS.
@@ -50,6 +57,21 @@ static scanners can't — it reads each table *as an anonymous attacker would*:
 ```bash
 airlock "$SUPABASE_DB_URL" --url "$SUPABASE_URL" --anon-key "$SUPABASE_ANON_KEY"
 ```
+
+### Scan a deployed site for an exposed service key (zero setup)
+
+The worst leak a Supabase app can have is its **service key in the browser** — a
+`service_role` JWT or an `sb_secret_...` key bundled into the frontend. It
+bypasses every RLS policy at once. Airlock finds it with **only your site URL** —
+no database, no credentials:
+
+```bash
+npx airlock-rls --site https://your-app.com
+```
+
+It fetches the page and its JS bundles and fails (exit `1`) if a service key is
+present. It **never** flags the `anon` key — that one is public by design — and
+**never** prints the key it finds.
 
 ---
 
@@ -85,6 +107,7 @@ the merge is blocked. A full example lives in [`examples/rls-gate.yml`](examples
 | `db-url`       | yes      | —          | Postgres connection string for the project to audit.               |
 | `allow`        | no       | `''`       | Comma-separated policy names that are permissive on purpose.       |
 | `schema`       | no       | `public`   | Schema to audit.                                                   |
+| `site`         | no       | `''`       | Deployed site URL to also scan for an exposed `service_role` key.  |
 | `node-version` | no       | `20`       | Node.js version used to run the audit.                            |
 
 ---
@@ -114,10 +137,18 @@ Get the URL from `supabase status` (local) or your project's connection string.
 --allow <names>    Policy names to treat as intentionally permissive
                    (also read from $RLS_AUDIT_ALLOW).
 --schema <name>    Schema to audit (default: public).
+--url URL          Supabase project URL — enables the DAST pass ($SUPABASE_URL).
+--anon-key VALUE   Public anon key for the DAST pass ($SUPABASE_ANON_KEY).
+--dast-write       Also probe anonymous INSERTs (safe — leaves no test data).
+--site URL         Deployed site URL — scan its HTML/JS for an exposed
+                   service_role key. Needs no database ($SUPABASE_SITE_URL).
 --json             Print the result as JSON instead of a report.
 -h, --help         Show help.
 -v, --version      Show the version.
 ```
+
+The DB URL is optional when you pass `--site`: `airlock --site https://your-app.com`
+runs the service-key scan on its own, with no database.
 
 ### Exit codes
 

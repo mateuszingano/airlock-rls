@@ -21,6 +21,7 @@
 
 import { audit } from '../src/audit.mjs'
 import { probeAnonReads, probeAnonWrites } from '../src/dast.mjs'
+import { scanSiteForServiceRole } from '../src/service-role.mjs'
 import { fuse, extractTable } from '../src/fuse.mjs'
 
 const RESET = '\x1b[0m'
@@ -43,6 +44,8 @@ Options:
   --schema <name>    Schema to audit (default: public).
   --url URL          Supabase project URL — enables the DAST pass ($SUPABASE_URL).
   --anon-key VALUE   Public anon credential for the DAST pass. Env: SUPABASE_ANON_KEY.
+  --site URL         Deployed site URL — scans its HTML/JS for an exposed
+                     service_role key. Needs no database. Env: SUPABASE_SITE_URL.
   --dast-write       Also probe anonymous INSERTs (safe: an empty payload fails a
                      column constraint, revealing RLS passed without persisting).
   --json             Print the result as JSON instead of a report.
@@ -55,7 +58,7 @@ actually read each table over the REST API and proves any anonymous leak.
 Exit codes: 0 = passed, 1 = exposure found, 2 = usage/connection error.`
 
 function parseArgs(argv) {
-  const opts = { dbUrl: undefined, schema: 'public', json: false, allow: [], url: undefined, anonKey: undefined, dastWrite: false }
+  const opts = { dbUrl: undefined, schema: 'public', json: false, allow: [], url: undefined, anonKey: undefined, site: undefined, dastWrite: false }
   const positional = []
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
@@ -83,6 +86,9 @@ function parseArgs(argv) {
       case '--anon-key':
         opts.anonKey = argv[++i]
         break
+      case '--site':
+        opts.site = argv[++i]
+        break
       case '--dast-write':
         opts.dastWrite = true
         break
@@ -91,6 +97,7 @@ function parseArgs(argv) {
         else if (a.startsWith('--schema=')) opts.schema = a.slice('--schema='.length) || 'public'
         else if (a.startsWith('--url=')) opts.url = a.slice('--url='.length)
         else if (a.startsWith('--anon-key=')) opts.anonKey = a.slice('--anon-key='.length)
+        else if (a.startsWith('--site=')) opts.site = a.slice('--site='.length)
         else if (a.startsWith('-')) throw new UsageError(`Unknown option: ${a}`)
         else positional.push(a)
     }
@@ -98,6 +105,7 @@ function parseArgs(argv) {
   opts.dbUrl = positional[0] || process.env.SUPABASE_DB_URL
   opts.url = opts.url || process.env.SUPABASE_URL
   opts.anonKey = opts.anonKey || process.env.SUPABASE_ANON_KEY
+  opts.site = opts.site || process.env.SUPABASE_SITE_URL
   // Env var merges with --allow; CLI names are additive, not a replacement.
   opts.allow = [...splitList(process.env.RLS_AUDIT_ALLOW), ...opts.allow]
   return opts
@@ -165,17 +173,22 @@ async function main() {
     console.log(await readVersion())
     return 0
   }
-  if (!opts.dbUrl) {
-    console.error('Missing database URL. Set SUPABASE_DB_URL or pass it as the first argument.')
+  if (!opts.dbUrl && !opts.site) {
+    console.error('Nothing to audit. Set SUPABASE_DB_URL (or pass it as the first argument)')
+    console.error('and/or pass --site <url> to scan a deployed site for an exposed service key.')
     console.error('Run `airlock --help` for usage.')
     return 2
   }
 
-  let result = await audit({ dbUrl: opts.dbUrl, schema: opts.schema, allow: opts.allow })
+  // With a DB URL we run the full RLS audit; with only --site we start from a
+  // clean slate and add the service-key scan (the zero-setup free hook).
+  let result = opts.dbUrl
+    ? await audit({ dbUrl: opts.dbUrl, schema: opts.schema, allow: opts.allow })
+    : { schema: opts.schema, findings: [], allowed: [], problems: 0, warnings: 0, passed: true, tables: [] }
 
   // DAST pass: prove exposure with the anon key, then FUSE it with the static
   // findings so every verdict is backed by evidence (and false positives die).
-  if (opts.url && opts.anonKey) {
+  if (opts.dbUrl && opts.url && opts.anonKey) {
     const { findings } = await probeAnonReads({
       projectUrl: opts.url,
       anonKey: opts.anonKey,
@@ -196,6 +209,20 @@ async function main() {
       })
       const freshWrites = writeFindings.filter((f) => !allowedTables.has(f.object))
       result.findings.push(...freshWrites)
+      result.findings.sort((a, b) => (a.severity === b.severity ? 0 : a.severity === 'fail' ? -1 : 1))
+      result.problems = result.findings.filter((f) => f.severity === 'fail').length
+      result.warnings = result.findings.filter((f) => f.severity === 'warn').length
+      result.passed = result.problems === 0
+    }
+  }
+
+  // Site scan: a service_role key shipped to the browser bypasses ALL RLS —
+  // the worst leak there is. Needs only the deployed site URL (no DB).
+  if (opts.site) {
+    const { findings, scanned } = await scanSiteForServiceRole({ siteUrl: opts.site })
+    result.siteScan = { scanned, url: opts.site }
+    if (findings.length) {
+      result.findings.push(...findings)
       result.findings.sort((a, b) => (a.severity === b.severity ? 0 : a.severity === 'fail' ? -1 : 1))
       result.problems = result.findings.filter((f) => f.severity === 'fail').length
       result.warnings = result.findings.filter((f) => f.severity === 'warn').length

@@ -67,6 +67,37 @@ test('probeAnonWrites flags the open table, not the locked one', async () => {
   assert.equal(findings[0].object, 'open')
 })
 
+test('write probe that creates a row DELETES it (never leaves test data)', async () => {
+  const calls = []
+  const fetchImpl = async (url, opts = {}) => {
+    calls.push(`${opts.method || 'GET'} ${url}`)
+    if (opts.method === 'POST') return { status: 201, text: async () => JSON.stringify([{ id: 42, note: 'x' }]) }
+    if (opts.method === 'DELETE') return { status: 204, ok: true }
+    return { status: 200, text: async () => '' }
+  }
+  const { findings } = await probeAnonWrites({ projectUrl: 'https://x.supabase.co', anonKey: 'k', tables: ['guestbook'], fetchImpl })
+  assert.equal(findings.length, 1)
+  assert.match(findings[0].detail, /deleted the test row/)
+  assert.ok(calls.some((c) => c.startsWith('DELETE') && c.includes('id=eq.42')), 'expected a DELETE by primary key')
+})
+
+test('write-probe cleanup deletes ONLY by own primary key, never a foreign key or non-unique column', async () => {
+  // A foreign key (user_id — many rows per user) and a default (status) must NOT
+  // be used as delete filters: either could wipe real rows on an already-open table.
+  for (const row of [{ status: 'new' }, { user_id: 'u1', status: 'new' }, { order_id: 7 }]) {
+    const calls = []
+    const fetchImpl = async (url, opts = {}) => {
+      calls.push(`${opts.method || 'GET'} ${url}`)
+      if (opts.method === 'POST') return { status: 201, text: async () => JSON.stringify([row]) }
+      if (opts.method === 'DELETE') return { status: 204, ok: true }
+      return { status: 200, text: async () => '' }
+    }
+    const { findings } = await probeAnonWrites({ projectUrl: 'https://x.supabase.co', anonKey: 'k', tables: ['t'], fetchImpl })
+    assert.ok(!calls.some((c) => c.startsWith('DELETE')), `must not DELETE for ${JSON.stringify(row)}`)
+    assert.match(findings[0].detail, /delete it manually/)
+  }
+})
+
 test('discoverTables path is used when tables not provided', async () => {
   const calls = []
   const fetchImpl = async (url) => {

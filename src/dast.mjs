@@ -48,7 +48,7 @@ export function classifyWriteProbe(table, status, bodyText = '') {
       kind: 'anon_write_leak',
       severity: 'fail',
       object: table,
-      detail: 'anon key INSERTED a row over the REST API — writes are open (a test row was created; delete it)',
+      detail: 'anon key INSERTED a row over the REST API — writes are open',
     }
   }
   if ((status === 400 || status === 409) && !/row-level security/i.test(bodyText)) {
@@ -65,8 +65,9 @@ export function classifyWriteProbe(table, status, bodyText = '') {
 /**
  * Probe each table for an anonymous INSERT. Sends `{}` — on any table with a
  * required column this fails the constraint (revealing RLS passed) WITHOUT
- * persisting a row. Opt-in, because on an all-nullable open table it can create
- * a row (which is itself the proof).
+ * persisting a row. Opt-in, because on an all-nullable open table it CAN create a
+ * row (which is itself the proof) — so we ask for the row back and delete it,
+ * never leaving test data behind (this matters most in CI).
  * @returns {Promise<{findings: import('./audit.mjs').Finding[], probed: number}>}
  */
 export async function probeAnonWrites({ projectUrl, anonKey, tables, fetchImpl = fetch }) {
@@ -81,7 +82,7 @@ export async function probeAnonWrites({ projectUrl, anonKey, tables, fetchImpl =
         apikey: anonKey,
         Authorization: `Bearer ${anonKey}`,
         'Content-Type': 'application/json',
-        Prefer: 'return=minimal',
+        Prefer: 'return=representation', // get the row back so we can delete it if one was created
       },
       body: '{}',
     })
@@ -92,9 +93,50 @@ export async function probeAnonWrites({ projectUrl, anonKey, tables, fetchImpl =
       body = ''
     }
     const f = classifyWriteProbe(t, res.status, body)
-    if (f) findings.push(f)
+    if (!f) continue
+    // If a row was actually created (201), clean it up — never leave test data.
+    if (res.status === 201) {
+      let rows = null
+      try {
+        rows = JSON.parse(body)
+      } catch {
+        rows = null
+      }
+      const row = Array.isArray(rows) ? rows[0] : rows
+      const cleaned = await deleteProbeRow({ base, table: t, anonKey, row, fetchImpl }).catch(() => false)
+      f.detail = cleaned
+        ? 'anon key INSERTED a row over the REST API — writes are open (Airlock deleted the test row it created)'
+        : 'anon key INSERTED a row over the REST API — writes are open (a test row was created — delete it manually)'
+    }
+    findings.push(f)
   }
   return { findings, probed: list.length }
+}
+
+/**
+ * Best-effort delete of a row the write-probe created, so Airlock never leaves
+ * test data behind. It deletes ONLY by the row's OWN primary key — a column named
+ * exactly `id` or `uuid`. It deliberately ignores foreign keys like `user_id`
+ * (NOT unique — a user has many rows) and any non-unique column (a `status`
+ * default): matching on those could delete REAL rows on an already-open table,
+ * which a security tool must never risk. No `id`/`uuid` → we don't delete; the
+ * finding names the row for manual removal.
+ * @returns {Promise<boolean>} true if the row was deleted
+ */
+export async function deleteProbeRow({ base, table, anonKey, row, fetchImpl = fetch }) {
+  if (!row || typeof row !== 'object') return false
+  const pk = Object.entries(row).filter(
+    ([k, v]) => v != null && ['string', 'number'].includes(typeof v) && /^(id|uuid)$/i.test(k)
+  )
+  if (!pk.length) return false // no own primary key to target → never fire a DELETE
+  const filters = pk
+    .map(([k, v]) => `${encodeURIComponent(k)}=eq.${encodeURIComponent(String(v))}`)
+    .join('&')
+  const res = await fetchImpl(`${base}/rest/v1/${encodeURIComponent(table)}?${filters}`, {
+    method: 'DELETE',
+    headers: { apikey: anonKey, Authorization: `Bearer ${anonKey}`, Prefer: 'return=minimal' },
+  })
+  return res.ok === true || res.status === 204 || res.status === 200
 }
 
 /** Discover the tables the REST API exposes, using the anon key's OpenAPI root. */

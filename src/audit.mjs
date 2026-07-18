@@ -46,6 +46,18 @@ export function isScoped(qual) {
   return false
 }
 
+/**
+ * If a policy is scoped ONLY through a helper function (no auth.uid()/service_role
+ * we can see), return the helper name — a static scan can't tell whether the
+ * helper actually restricts (is_public() would leak). Used to emit a soft warn.
+ */
+export function helperScope(qual) {
+  if (qual == null) return null
+  if (/auth\.uid\(\)|current_setting|auth\.jwt\(\)|'service_role'/i.test(qual)) return null
+  const m = /\b((?:get|is|has|current)_\w+)\s*\(/i.exec(qual)
+  return m ? m[1] : null
+}
+
 /** Roles that include the anonymous (public API) caller. */
 function includesAnon(roles = []) {
   return roles.includes('anon') || roles.includes('public')
@@ -132,6 +144,26 @@ export function classifyPolicy(p, ctx = {}) {
         severity: 'warn',
         object,
         detail: `[${p.cmd}] any authenticated user reads all rows${literal ? ' — USING(true)' : ` (no auth.uid()) — USING (${short(p.qual)})`}`,
+      })
+    }
+  }
+
+  // 1b) Helper-scoped and client-reachable: static analysis can't see inside the
+  // helper, so warn (a helper that returns true for everyone would leak). Covers
+  // anon AND authenticated — an authed-only helper that doesn't restrict lets any
+  // logged-in user read every row, same failure mode a notch less exposed.
+  if (readish && (anonRead || authRead)) {
+    const helper = helperScope(p.qual)
+    if (helper) {
+      const who = anonRead ? 'anon' : 'any authenticated user'
+      const prove = anonRead
+        ? ' (add --url/--anon-key to prove it, or allow-list if intentional)'
+        : ' (allow-list it if intentional)'
+      out.push({
+        kind: 'helper_scoped',
+        severity: 'warn',
+        object,
+        detail: `[${p.cmd}] ${who} read is scoped only through ${helper}() — a static scan can't see inside it; verify it restricts the caller${prove}`,
       })
     }
   }
@@ -335,6 +367,14 @@ export async function audit({ dbUrl, schema = 'public', allow = [] } = {}) {
   // SSL/Supabase connection and connect encrypted without cert pinning. Local
   // plaintext connections (no sslmode, localhost) keep working untouched.
   const usesSsl = /sslmode=(require|verify|prefer)|\.supabase\.(co|com)/i.test(dbUrl)
+  // Honesty: if the caller explicitly asked for cert verification, say out loud
+  // (on stderr — never stdout, so --json stays clean) that we're overriding it.
+  if (usesSsl && /sslmode=verify-(full|ca)/i.test(dbUrl)) {
+    console.warn(
+      "airlock: overriding sslmode=verify-* — connecting over TLS but WITHOUT certificate verification " +
+        "(Supabase's cert isn't in the system CA bundle). Encrypted, not MitM-proof. See SECURITY.md."
+    )
+  }
   // Strip sslmode from the URL (pg would parse `require` as verify-full and fail
   // on Supabase's cert chain) and set our own ssl config instead.
   const cleanUrl = usesSsl
