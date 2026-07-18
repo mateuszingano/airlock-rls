@@ -23,6 +23,18 @@ inputs:
     description: 'Deployed site URL to scan for an exposed service_role key (bypasses all RLS). Optional; needs no database.'
     required: false
     default: ''
+  url:
+    description: 'Supabase project URL. With anon-key, enables the DAST pass that PROVES exposure by actually reading each table with the anon key.'
+    required: false
+    default: ''
+  anon-key:
+    description: 'Public anon key for the DAST pass (public by design — safe to pass). Only used together with url.'
+    required: false
+    default: ''
+  dast-write:
+    description: 'Also probe anonymous INSERTs during the DAST pass (safe — leaves no test data). Set to "true" to enable.'
+    required: false
+    default: 'false'
   node-version:
     description: 'Node.js version used to run the audit.'
     required: false
@@ -39,12 +51,17 @@ runs:
     - name: Install audit dependencies
       shell: bash
       working-directory: ${{ github.action_path }}
-      run: npm install --omit=dev --no-audit --no-fund
+      run: npm ci --omit=dev --no-audit --no-fund
 
     - name: Run RLS audit (the gate)
       shell: bash
-      run: node "${{ github.action_path }}/bin/airlock.mjs" --schema "${{ inputs.schema }}"
+      run: >
+        node "${{ github.action_path }}/bin/airlock.mjs"
+        --schema "${{ inputs.schema }}"
+        ${{ inputs.dast-write == 'true' && '--dast-write' || '' }}
       env:
         SUPABASE_DB_URL: ${{ inputs.db-url }}
         RLS_AUDIT_ALLOW: ${{ inputs.allow }}
         SUPABASE_SITE_URL: ${{ inputs.site }}
+        SUPABASE_URL: ${{ inputs.url }}
+        SUPABASE_ANON_KEY: ${{ inputs.anon-key }}

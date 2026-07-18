@@ -31,18 +31,68 @@
  */
 
 /**
+ * Does this qualifier always evaluate true, so it can't scope anything?
+ * Catches the two ways a scope token gets neutralised:
+ *  - an OR-joined literal-true disjunct: `auth.uid() = owner OR true`, `... OR 1=1`
+ *    (the scoped part is present but irrelevant — the whole expression is true)
+ *  - a bare tautology as the entire qualifier: `1=1`, `'x'='x'`, `(true)`
+ * A permissive policy whose qual is a tautology is as open as USING(true).
+ */
+export function isPermissiveTautology(qual) {
+  if (qual == null) return false
+  const q = String(qual).toLowerCase()
+  const padded = ` ${q.replace(/\s+/g, ' ')} `
+  // OR-joined literal-true disjunct (optional surrounding parens on the literal)
+  if (/\bor\s+\(*\s*true\b/.test(padded) || /\btrue\s*\)*\s+or\b/.test(padded)) return true
+  if (/\bor\s+\(*\s*1\s*=\s*1\b/.test(padded) || /\b1\s*=\s*1\s*\)*\s+or\b/.test(padded)) return true
+  // bare tautology as the whole qualifier
+  const bare = q.replace(/[()\s]/g, '')
+  if (bare === 'true') return true
+  if (/^1=1$/.test(bare)) return true
+  if (/^'([^']*)'='\1'$/.test(bare)) return true
+  return false
+}
+
+/** The auth/session built-ins we understand precisely (a real, visible scope). */
+function realScope(qual) {
+  if (/auth\.uid\(\)|current_setting|auth\.jwt\(\)/i.test(qual)) return true
+  if (/'service_role'/i.test(qual)) return true // restricted to the backend role
+  return false
+}
+
+/**
+ * First user-defined function call that could be a scoping helper — a static
+ * scan can't see inside it, so it warrants a soft warn, not a pass or a hard
+ * fail. Recognises ANY helper name (authorize(), belongs_to_org(), can_read(),
+ * get_/is_/has_*), not just a fixed prefix. Ignores the built-ins we handle
+ * precisely (auth.uid/jwt/role, current_setting) and the SQL keywords that take
+ * parens (select/exists in subqueries). Returns null if none.
+ */
+function helperCall(qual) {
+  const re = /\b((?:\w+\.)?\w+)\s*\(/g
+  const skip = new Set(['auth.uid', 'auth.jwt', 'auth.role', 'current_setting', 'select', 'exists'])
+  let m
+  while ((m = re.exec(qual)) !== null) {
+    if (!skip.has(m[1].toLowerCase())) return m[1]
+  }
+  return null
+}
+
+/**
  * Does this policy qualifier scope access (so it's not an open anon read)?
  * Recognises the real Supabase patterns:
  *  - per-user: auth.uid() / current_setting / auth.jwt()
  *  - restricted to a backend role: auth.role() = 'service_role' (NOT
  *    'authenticated'/'anon' — those stay flagged as role-only)
- *  - scoping through a SECURITY DEFINER helper: get_/is_/has_/current_*()
+ *  - scoping through a helper function of ANY name (see helperCall)
+ * A tautology (`... OR true`, `1=1`) never counts as scoped, even when a scope
+ * token is also present.
  */
 export function isScoped(qual) {
   if (qual == null) return false
-  if (/auth\.uid\(\)|current_setting|auth\.jwt\(\)/i.test(qual)) return true
-  if (/'service_role'/i.test(qual)) return true // restricted to the backend role
-  if (/\b(get|is|has|current)_\w+\(/i.test(qual)) return true // scoping via a helper
+  if (isPermissiveTautology(qual)) return false
+  if (realScope(qual)) return true
+  if (helperCall(qual)) return true
   return false
 }
 
@@ -53,9 +103,9 @@ export function isScoped(qual) {
  */
 export function helperScope(qual) {
   if (qual == null) return null
-  if (/auth\.uid\(\)|current_setting|auth\.jwt\(\)|'service_role'/i.test(qual)) return null
-  const m = /\b((?:get|is|has|current)_\w+)\s*\(/i.exec(qual)
-  return m ? m[1] : null
+  if (isPermissiveTautology(qual)) return null
+  if (realScope(qual)) return null
+  return helperCall(qual)
 }
 
 /** Roles that include the anonymous (public API) caller. */
@@ -113,7 +163,8 @@ export function classifyPolicy(p, ctx = {}) {
 
   const object = `${p.tablename}."${p.policyname}"`
   const out = []
-  const scoped = isScoped(p.qual)
+  const taut = isPermissiveTautology(p.qual)
+  const scoped = isScoped(p.qual) // false when taut (isScoped short-circuits on tautology)
   const readish = READ_CMDS.has(p.cmd)
   const writeish = WRITE_CMDS.has(p.cmd)
 
@@ -125,9 +176,11 @@ export function classifyPolicy(p, ctx = {}) {
   const anonWrite = includesAnon(p.roles) && hasGrant(grants, 'anon', writePriv)
   const authWrite = includesAuthenticated(p.roles) && hasGrant(grants, 'authenticated', writePriv)
 
-  // 1) Read side.
-  if (readish && (p.qual === 'true' || (p.qual != null && !scoped))) {
-    const literal = p.qual === 'true'
+  // 1) Read side. A literal `true`, a tautology (`... OR true`, `1=1`), or any
+  // non-scoping qualifier all expose rows.
+  if (readish && (p.qual === 'true' || taut || (p.qual != null && !scoped))) {
+    const literal = p.qual === 'true' || taut
+    const how = p.qual === 'true' ? 'USING(true)' : `USING (${short(p.qual)}) always evaluates true`
     if (anonRead) {
       const saved = restrictiveScopes(restrictives, p.cmd, 'anon')
       out.push({
@@ -135,7 +188,7 @@ export function classifyPolicy(p, ctx = {}) {
         severity: saved ? 'warn' : 'fail',
         object,
         detail: literal
-          ? `[${p.cmd}] USING(true) — anon reads every row${saved ? ' (a restrictive policy narrows it — verify)' : ''}`
+          ? `[${p.cmd}] ${how} — anon reads every row${saved ? ' (a restrictive policy narrows it — verify)' : ''}`
           : `[${p.cmd}] anon reads without scoping to a user — USING (${short(p.qual)})${saved ? ' (restrictive-narrowed — verify)' : ''}`,
       })
     } else if (authRead) {
@@ -143,7 +196,7 @@ export function classifyPolicy(p, ctx = {}) {
         kind: literal ? 'permissive_true' : 'authenticated_unscoped',
         severity: 'warn',
         object,
-        detail: `[${p.cmd}] any authenticated user reads all rows${literal ? ' — USING(true)' : ` (no auth.uid()) — USING (${short(p.qual)})`}`,
+        detail: `[${p.cmd}] any authenticated user reads all rows${literal ? ` — ${how}` : ` (no auth.uid()) — USING (${short(p.qual)})`}`,
       })
     }
   }
@@ -168,20 +221,33 @@ export function classifyPolicy(p, ctx = {}) {
     }
   }
 
-  // 2) Write side — WITH CHECK(true) or missing check, but only if a role can write.
+  // 2) Write side — WITH CHECK literal-true, tautology, present-but-unscoped, or
+  // missing, but only if a role can actually write.
   if (writeish && (anonWrite || authWrite)) {
-    if (p.with_check === 'true') {
-      const saved = restrictiveScopes(restrictives, p.cmd, anonWrite ? 'anon' : 'authenticated')
+    const wc = p.with_check
+    const wcTaut = wc === 'true' || isPermissiveTautology(wc)
+    const saved = restrictiveScopes(restrictives, p.cmd, anonWrite ? 'anon' : 'authenticated')
+    if (wcTaut) {
       out.push({
         kind: 'permissive_true',
         severity: saved ? 'warn' : 'fail',
         object,
-        detail: `[${p.cmd}] WITH CHECK(true) — writes are not tied to the caller (a row can be forged as anyone)${saved ? ' (restrictive-narrowed — verify)' : ''}`,
+        detail: `[${p.cmd}] WITH CHECK(${wc === 'true' ? 'true' : short(wc)}) always passes — writes are not tied to the caller (a row can be forged as anyone)${saved ? ' (restrictive-narrowed — verify)' : ''}`,
       })
-    } else if ((p.with_check == null || p.with_check === '') && !scoped && p.qual !== 'true') {
+    } else if (wc != null && wc !== '' && !isScoped(wc)) {
+      // A WITH CHECK is present but doesn't scope the new row to the caller, so
+      // anon (or any authenticated user) can INSERT rows attributed to another
+      // tenant. anon → fail; authenticated-only → warn (a notch less exposed).
+      out.push({
+        kind: 'write_unscoped',
+        severity: anonWrite && !saved ? 'fail' : 'warn',
+        object,
+        detail: `[${p.cmd}] WITH CHECK (${short(wc)}) doesn't tie the row to the caller — ${anonWrite ? 'anon' : 'any authenticated user'} can forge rows as another tenant${saved ? ' (restrictive-narrowed — verify)' : ''}`,
+      })
+    } else if ((wc == null || wc === '') && !scoped && p.qual !== 'true' && !taut) {
       // When WITH CHECK is omitted, Postgres uses the USING expression as the
       // check for new/updated rows. So this is only an unguarded write when
-      // USING doesn't scope (and isn't the literal-true case, already flagged).
+      // USING doesn't scope (and isn't a literal-true/tautology case, already flagged).
       out.push({
         kind: 'write_unchecked',
         severity: 'warn',
@@ -232,7 +298,14 @@ export function buildResult({
     grantsByTable = {}
     for (const g of grants) {
       const t = grantsByTable[g.table_name] || (grantsByTable[g.table_name] = { anon: new Set(), authenticated: new Set() })
-      if (t[g.grantee]) t[g.grantee].add(g.privilege_type)
+      const grantee = String(g.grantee).toLowerCase()
+      // A grant to PUBLIC is held by every role — including anon and authenticated.
+      if (grantee === 'public') {
+        t.anon.add(g.privilege_type)
+        t.authenticated.add(g.privilege_type)
+      } else if (t[grantee]) {
+        t[grantee].add(g.privilege_type)
+      }
     }
   }
   const grantsFor = (table) =>
@@ -406,7 +479,7 @@ export async function audit({ dbUrl, schema = 'public', allow = [] } = {}) {
     const { rows: grants } = await client.query(
       `select table_name, grantee, privilege_type
          from information_schema.role_table_grants
-        where table_schema = $1 and grantee in ('anon','authenticated')`,
+        where table_schema = $1 and grantee in ('anon','authenticated','PUBLIC')`,
       [schema]
     )
     const { rows: allTables } = await client.query(

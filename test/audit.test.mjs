@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { buildResult, classifyPolicy, isScoped } from '../src/audit.mjs'
+import { buildResult, classifyPolicy, isScoped, isPermissiveTautology } from '../src/audit.mjs'
 
 const policy = (over) => ({
   tablename: 't',
@@ -287,4 +287,123 @@ test('a Realtime table that is NOT anon-readable does not warn', () => {
     realtimeTables: [{ tablename: 'chat' }],
   })
   assert.ok(!kinds(r).includes('realtime_exposure'))
+})
+
+// --- P0 fix #1: a scope token neutralised by `OR true` / tautology still fails ---
+
+test('isPermissiveTautology: catches OR-true, OR 1=1, and bare tautologies', () => {
+  assert.equal(isPermissiveTautology('auth.uid() = user_id OR true'), true)
+  assert.equal(isPermissiveTautology('(auth.uid() = owner OR 1=1)'), true)
+  assert.equal(isPermissiveTautology('true OR is_member(org)'), true)
+  assert.equal(isPermissiveTautology('1 = 1'), true)
+  assert.equal(isPermissiveTautology("'x' = 'x'"), true)
+  assert.equal(isPermissiveTautology('(true)'), true)
+  // real predicates must NOT be mistaken for tautologies
+  assert.equal(isPermissiveTautology('published = true'), false)
+  assert.equal(isPermissiveTautology('(auth.uid() = user_id)'), false)
+  assert.equal(isPermissiveTautology("status = 'published'"), false)
+  assert.equal(isPermissiveTautology('a = 1 OR b = 1'), false)
+})
+
+test('NEW #1: USING (auth.uid() = user_id OR true) for anon → permissive_true (FAIL)', () => {
+  const r = buildResult({
+    schema: 'public',
+    policies: [policy({ roles: ['anon'], cmd: 'SELECT', qual: 'auth.uid() = user_id OR true' })],
+  })
+  assert.deepEqual(kinds(r), ['permissive_true'])
+  assert.equal(r.problems, 1)
+})
+
+test('NEW #1: a tautology-scoped read for authenticated is flagged (permissive_true warn)', () => {
+  const r = buildResult({
+    schema: 'public',
+    policies: [policy({ roles: ['authenticated'], cmd: 'SELECT', qual: 'auth.uid() = owner OR 1=1' })],
+  })
+  assert.deepEqual(kinds(r), ['permissive_true'])
+  assert.equal(r.warnings, 1)
+})
+
+test('isScoped: a real scope neutralised by OR true is NOT scoped', () => {
+  assert.equal(isScoped('auth.uid() = user_id OR true'), false)
+  assert.equal(isScoped('(auth.uid() = user_id)'), true) // the honest scope still passes
+})
+
+// --- P0 fix #2: WITH CHECK present but not scoped ---
+
+test('NEW #2: INSERT anon with WITH CHECK (status = ...) not scoped → write_unscoped (FAIL)', () => {
+  const r = buildResult({
+    schema: 'public',
+    policies: [policy({ roles: ['anon'], cmd: 'INSERT', qual: null, with_check: "status = 'pending'" })],
+  })
+  assert.deepEqual(kinds(r), ['write_unscoped'])
+  assert.equal(r.problems, 1)
+})
+
+test('NEW #2: INSERT anon with WITH CHECK (1=1) → permissive_true (FAIL)', () => {
+  const r = buildResult({
+    schema: 'public',
+    policies: [policy({ roles: ['anon'], cmd: 'INSERT', qual: null, with_check: '1 = 1' })],
+  })
+  assert.deepEqual(kinds(r), ['permissive_true'])
+  assert.equal(r.problems, 1)
+})
+
+test('NEW #2: authenticated-only unscoped WITH CHECK is a warn, not a fail', () => {
+  const r = buildResult({
+    schema: 'public',
+    policies: [policy({ roles: ['authenticated'], cmd: 'INSERT', qual: null, with_check: "kind = 'note'" })],
+  })
+  assert.deepEqual(kinds(r), ['write_unscoped'])
+  assert.equal(r.problems, 0)
+  assert.equal(r.warnings, 1)
+})
+
+test('correctness #2: a scoped WITH CHECK (auth.uid()) is NOT flagged', () => {
+  const r = buildResult({
+    schema: 'public',
+    policies: [policy({ roles: ['authenticated'], cmd: 'INSERT', qual: null, with_check: '(auth.uid() = user_id)' })],
+  })
+  assert.equal(r.findings.length, 0)
+})
+
+// --- P0 fix #3: any helper name routes to helper_scoped (no crying wolf) ---
+
+test('NEW #3: authorize(...) (official Supabase RBAC) anon read → helper_scoped WARN, not fail', () => {
+  const r = buildResult({
+    schema: 'public',
+    policies: [policy({ roles: ['anon'], cmd: 'SELECT', qual: "authorize('posts.read')" })],
+  })
+  assert.deepEqual(kinds(r), ['helper_scoped'])
+  assert.equal(r.problems, 0)
+  assert.match(r.findings[0].detail, /through authorize\(\)/)
+})
+
+test('NEW #3: belongs_to_org() authenticated read → helper_scoped WARN', () => {
+  const r = buildResult({
+    schema: 'public',
+    policies: [policy({ roles: ['authenticated'], cmd: 'SELECT', qual: 'belongs_to_org(org_id)' })],
+  })
+  assert.deepEqual(kinds(r), ['helper_scoped'])
+  assert.match(r.findings[0].detail, /through belongs_to_org\(\)/)
+})
+
+test('correctness #3: auth.role() = authenticated is still role-only (NOT a helper pass)', () => {
+  // regression guard — auth.role() is a built-in, not a scoping helper
+  const r = buildResult({
+    schema: 'public',
+    policies: [policy({ roles: ['authenticated'], cmd: 'SELECT', qual: "auth.role() = 'authenticated'" })],
+  })
+  assert.deepEqual(kinds(r), ['authenticated_unscoped'])
+})
+
+// --- P0 fix #4: GRANT ... TO public is held by anon ---
+
+test('NEW #4: GRANT SELECT TO public + USING(true) → permissive_true (FAIL)', () => {
+  const r = buildResult({
+    schema: 'public',
+    policies: [policy({ roles: ['anon'], qual: 'true' })],
+    grants: [{ table_name: 't', grantee: 'PUBLIC', privilege_type: 'SELECT' }],
+  })
+  assert.deepEqual(kinds(r), ['permissive_true'])
+  assert.equal(r.problems, 1)
 })

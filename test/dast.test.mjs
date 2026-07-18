@@ -46,10 +46,11 @@ test('write probe: 201 = proven write leak', () => {
   assert.equal(f.severity, 'fail')
 })
 
-test('write probe: constraint error = RLS passed, write exposed (safe, no row)', () => {
+test('write probe: constraint error = INCONCLUSIVE (warn) — NOT NULL can fire before RLS check', () => {
   const f = classifyWriteProbe('waitlist', 400, 'null value in column "email" violates not-null constraint')
-  assert.equal(f.kind, 'anon_write_leak')
-  assert.match(f.detail, /constraint/)
+  assert.equal(f.kind, 'anon_write_inconclusive')
+  assert.equal(f.severity, 'warn')
+  assert.match(f.detail, /inconclusive/)
 })
 
 test('write probe: constraint error that IS an RLS message = blocked', () => {

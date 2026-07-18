@@ -27,12 +27,16 @@ Airlock audits the *logic* of your policies, not just their presence.
 
 **Fails the build (exposure):**
 1. **`rls_disabled`** — a table with RLS off; every row exposed to the API roles.
-2. **`permissive_true`** — a policy `USING (true)` / `WITH CHECK (true)`.
+2. **`permissive_true`** — a policy `USING (true)` / `WITH CHECK (true)`, **or one
+   that reduces to always-true** (`... OR true`, `1 = 1`) — the scope token is
+   present but the row still matches for everyone.
 3. **`anon_unscoped`** — an anon-readable policy that doesn't scope to the user
    (no `auth.uid()`) — everyone reads every row, even when it isn't literally `true`.
-4. **`anon_read_leak`** *(DAST)* — with an anon key, Airlock actually reads each
+4. **`write_unscoped`** — an anon INSERT/UPDATE whose `WITH CHECK` is present but
+   doesn't tie the new row to the caller — anyone can forge rows as another tenant.
+5. **`anon_read_leak`** *(DAST)* — with an anon key, Airlock actually reads each
    table over the REST API; a returned row is a **proven** leak, not an inference.
-5. **`service_role_exposed`** — a Supabase **service key** shipped to the browser
+6. **`service_role_exposed`** — a Supabase **service key** shipped to the browser
    (a `service_role` JWT or an `sb_secret_...` key). It bypasses *every* RLS
    policy at once, so whoever reads it owns your database. Scanned straight from
    your deployed site — no database needed (see below).
@@ -40,11 +44,22 @@ Airlock audits the *logic* of your policies, not just their presence.
 **Warns (worth a review):**
 - **`authenticated_unscoped`** — any logged-in user reads all rows (role-only check).
 - **`helper_scoped`** — a client-reachable read scoped *only* through a helper
-  function (e.g. `is_public()`); a static scan can't see inside it, so verify it
-  actually restricts the caller (or allow-list it if intentional).
+  function of any name (`is_public()`, `authorize('posts.read')`, `belongs_to_org()`);
+  a static scan can't see inside it, so verify it actually restricts the caller
+  (or allow-list it if intentional).
 - **`write_unchecked`** — an INSERT/UPDATE policy with no `WITH CHECK` guard.
+- **`anon_write_inconclusive`** *(DAST, `--dast-write`)* — an anon INSERT hit a
+  column constraint (e.g. `NOT NULL`), not an RLS block. That can fire *before*
+  the RLS check, so it does **not** prove RLS would admit a valid row — verify by
+  hand. Only a `201` (a row actually inserted) is reported as a proven write leak.
 - **`public_bucket`** — a public storage bucket.
 - **`security_definer`** — a function that runs as its owner and can bypass RLS.
+
+**What it does NOT cover yet (declared, not silently missed):**
+- Custom database roles beyond `anon`/`authenticated`/`public` in a `USING(true)`
+  policy — whether a custom role is client-reachable is undecidable statically.
+- A `WITH CHECK` scoped *only* through a helper function is treated as scoped
+  (same "can't see inside" limit as reads) — use the DAST write probe to prove it.
 
 Intentionally-public policies (a status page, a contact form) can be waved
 through with an allow-list, so the gate stays honest without crying wolf.
@@ -108,6 +123,9 @@ the merge is blocked. A full example lives in [`examples/rls-gate.yml`](examples
 | `allow`        | no       | `''`       | Comma-separated policy names that are permissive on purpose.       |
 | `schema`       | no       | `public`   | Schema to audit.                                                   |
 | `site`         | no       | `''`       | Deployed site URL to also scan for an exposed `service_role` key.  |
+| `url`          | no       | `''`       | Supabase project URL. With `anon-key`, runs the DAST pass that **proves** exposure. |
+| `anon-key`     | no       | `''`       | Public anon key for the DAST pass (public by design). Used with `url`. |
+| `dast-write`   | no       | `false`    | Also probe anonymous INSERTs during DAST (safe — leaves no test data). |
 | `node-version` | no       | `20`       | Node.js version used to run the audit.                            |
 
 ---

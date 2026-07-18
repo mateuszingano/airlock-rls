@@ -34,10 +34,11 @@ export function classifyProbe(table, status, rows) {
  *
  *   RLS error / 401 / 403           → blocked (safe)
  *   201 created                     → PROVEN write leak (a row was inserted)
- *   400/409 NON-RLS (constraint)    → RLS let it through; only a column
- *                                     constraint stopped it → write is exposed
- *                                     (an attacker can craft a valid row). Safe:
- *                                     nothing was persisted.
+ *   400/409 NON-RLS (constraint)    → INCONCLUSIVE (warn). Postgres evaluates
+ *                                     NOT NULL during tuple assembly, which can
+ *                                     fire BEFORE the RLS WITH CHECK — so a
+ *                                     constraint error does NOT prove RLS would
+ *                                     admit a complete row. Verify manually.
  * @returns {import('./audit.mjs').Finding|null}
  */
 export function classifyWriteProbe(table, status, bodyText = '') {
@@ -52,11 +53,15 @@ export function classifyWriteProbe(table, status, bodyText = '') {
     }
   }
   if ((status === 400 || status === 409) && !/row-level security/i.test(bodyText)) {
+    // A column constraint (e.g. NOT NULL) stopped the empty payload. That can
+    // fire before the RLS check, so we CAN'T prove RLS would admit a full row.
+    // Warn instead of claiming a proven leak — the tool promises zero false
+    // positives, and "a returned row is a returned row" only holds for 201.
     return {
-      kind: 'anon_write_leak',
-      severity: 'fail',
+      kind: 'anon_write_inconclusive',
+      severity: 'warn',
       object: table,
-      detail: 'anon write passed RLS (stopped only by a column constraint) — an attacker can forge a valid row',
+      detail: 'anon write hit a column constraint, not an RLS block — RLS may or may not admit a valid row (inconclusive; verify this table manually with a complete payload)',
     }
   }
   return null // 404 (not exposed) or anything else → no proven write leak
