@@ -23,15 +23,29 @@ function kinds(result) {
 test('fail-safe: an unproven OR branch next to auth.uid() WARNs (never silent green)', () => {
   const widen = [
     "auth.uid() = user_id OR status = 'published'",
-    'auth.uid() = user_id OR (1=1 AND 2=2)',          // AND-group tautology the denylist misses
     'auth.uid() = user_id OR deleted_at is null OR deleted_at is not null',
-    'auth.uid() = user_id OR coalesce(true, false)',
     'auth.uid() = user_id OR is_public()',            // helper on an OR branch widens
   ]
   for (const qual of widen) {
     const r = buildResult({ schema: 'public', policies: [policy({ roles: ['authenticated'], cmd: 'SELECT', qual })] })
     assert.ok(kinds(r).includes('or_branch_unscoped'), `expected a warn for: ${qual}`)
     assert.equal(r.problems, 0) // it's a WARN, not a hard fail (could be intentional public sharing)
+  }
+})
+
+// The parse-tree engine PROVES these branches are always-true, so they are no
+// longer a soft "unproven branch" warn — they are the real thing: a tautology
+// that opens the table. Stronger verdict than the old regex engine could give.
+test('a provable tautology on an OR branch is a permissive_true FAIL, not just a warn', () => {
+  for (const qual of [
+    'auth.uid() = user_id OR (1=1 AND 2=2)',        // AND-group of constants
+    'auth.uid() = user_id OR coalesce(true, false)', // coalesce to a constant true
+    'auth.uid() = owner OR auth.uid() = auth.uid()', // reflexive on the token
+    "auth.uid() = owner OR current_setting('x') = current_setting('x')",
+    'auth.uid() = owner OR auth.uid() in (auth.uid())',
+  ]) {
+    const r = buildResult({ schema: 'public', policies: [policy({ roles: ['authenticated'], cmd: 'SELECT', qual })] })
+    assert.ok(kinds(r).includes('permissive_true'), `expected permissive_true for: ${qual}`)
   }
 })
 
@@ -61,13 +75,13 @@ test('fail-safe: an anon-reachable widening OR branch still warns (verify, not s
 // logged-in user reads the whole table) passed green. realScope now requires the
 // token to RESTRICT (be compared to a per-row value), not merely appear.
 test('fail-safe: a token that is present but not restrictive still WARNs (not silent green)', () => {
+  // These are NOT provably always-true (auth.uid() may be NULL for anon), so they
+  // stay a soft warn. The reflexive ones moved to the tautology test above, where
+  // the parse tree proves them always-true and the verdict is a hard fail.
   const widen = [
     'auth.uid() = owner OR auth.uid() is not null',   // any authenticated caller reads all
-    'auth.uid() = owner OR auth.uid() = auth.uid()',  // reflexive on the token
-    "auth.uid() = owner OR current_setting('x') = current_setting('x')",
     'auth.uid() = owner OR auth.jwt() is not null',
     'auth.uid() = owner OR auth.uid() = ANY(ARRAY[auth.uid()])',
-    'auth.uid() = owner OR auth.uid() in (auth.uid())',
   ]
   for (const qual of widen) {
     const r = buildResult({ schema: 'public', policies: [policy({ roles: ['authenticated'], cmd: 'SELECT', qual })] })

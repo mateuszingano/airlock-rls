@@ -30,238 +30,72 @@
  * @property {boolean} passed       problems === 0
  */
 
-/** Strip one or more fully-enclosing paren pairs: "((x))" → "x". */
-function stripOuterParens(s) {
-  s = s.trim()
-  while (s.startsWith('(') && s.endsWith(')')) {
-    let depth = 0
-    let matches = true
-    for (let i = 0; i < s.length; i++) {
-      if (s[i] === '(') depth++
-      else if (s[i] === ')') {
-        depth--
-        if (depth === 0 && i < s.length - 1) { matches = false; break }
-      }
-    }
-    if (matches) s = s.slice(1, -1).trim()
-    else break
-  }
-  return s
-}
+import {
+  isTautology as coreIsTautology,
+  restrictsToCallerQual,
+  helperCallQual,
+  hasUnprovenOrBranch as coreHasUnprovenOrBranch,
+} from './scope.mjs'
+
+// ── Qualifier predicates ────────────────────────────────────────────────────
+// These used to reason about the qualifier with regexes (paren counting, `or`
+// splitting on raw text). That is fundamentally unsafe: a string literal holding
+// a parenthesis (`note = '('`) unbalances the count and hides a top-level
+// `OR 1=1`, so a policy that leaks every row passed green. They now delegate to
+// `airlock-core`, which decides on a REAL SQL parse tree, where a string literal
+// is just a leaf and can never change the structure. The Monitor shares the same
+// engine, so a fix lands in one place.
 
 /**
- * Is this single boolean term ALWAYS true, so it can't scope anything?
- *  - the literal `true`
- *  - a reflexive equality — both sides the identical literal OR column:
- *    `1=1`, `2=2`, `'a'='a'`, `owner_id = owner_id`
- *  - a constant comparison that holds: `1<2`, `5>=5`, `'a'<>'b'`
- *  - a constant IN a constant list: `1 in (1)`, `'a' in ('a','b')`
- *  - a non-negative built-in the comparison can't falsify: `length(x) >= 0`,
- *    `char_length(x) > -1` (these functions return an int >= 0)
- * (`1=2` and `a=b` are NOT tautologies and stay false.)
- */
-function isAlwaysTrueTerm(term) {
-  const s = stripOuterParens(term)
-  if (s === 'true') return true
-  // A sub-expression that itself has a top-level OR is always-true if ANY of its
-  // disjuncts is — recurse, so a NESTED tautology like `(a OR 2=2)` is caught.
-  const disj = splitTopLevelOr(s)
-  if (disj.length > 1) return disj.some(isAlwaysTrueTerm)
-  const OPERAND = "'[^']*'|[\\w.]+"
-  // reflexive: same operand on both sides of `=` (covers lit=lit AND col=col)
-  const refl = new RegExp(`^(${OPERAND})\\s*=\\s*(${OPERAND})$`).exec(s)
-  if (refl && refl[1] === refl[2]) return true
-  // constant OP constant → evaluate (both sides number, or both string)
-  const cmp = new RegExp(`^(-?\\d+(?:\\.\\d+)?|'[^']*')\\s*(=|<>|!=|<=|>=|<|>)\\s*(-?\\d+(?:\\.\\d+)?|'[^']*')$`).exec(s)
-  if (cmp) {
-    const [, a, op, b] = cmp
-    const aStr = a.startsWith("'"), bStr = b.startsWith("'")
-    if (aStr !== bStr) return false // mixed types — don't guess
-    const va = aStr ? a : parseFloat(a)
-    const vb = bStr ? b : parseFloat(b)
-    switch (op) {
-      case '=': return va === vb
-      case '<>': case '!=': return va !== vb
-      case '<': return va < vb
-      case '>': return va > vb
-      case '<=': return va <= vb
-      case '>=': return va >= vb
-    }
-  }
-  // constant IN a constant list → always-true iff the constant is in the list:
-  //   `1 in (1)`, `1 in (1, 2)`, `'a' in ('a','b')`. A column or subquery
-  //   (`email in (select ...)`) is NOT constant, so it stays scoped/unevaluated.
-  const inm = new RegExp(`^(${OPERAND})\\s+in\\s*\\((.+)\\)$`).exec(s)
-  if (inm) {
-    const needle = inm[1]
-    const CONST = /^(-?\d+(?:\.\d+)?|'[^']*')$/
-    if (!CONST.test(needle)) return false // left side is a column — can't decide
-    const list = splitTopLevelCommas(inm[2]).map((x) => x.trim())
-    if (list.length && list.every((x) => CONST.test(x))) return list.includes(needle)
-    return false
-  }
-  // a non-negative built-in compared so the result ALWAYS satisfies it:
-  //   `length(x) >= 0`, `char_length(x) > -1`, `octet_length(x) <> -1`.
-  // These functions return an integer >= 0, so the predicate can never be false.
-  const NONNEG = 'length|char_length|character_length|octet_length|bit_length|cardinality'
-  const nn = new RegExp(`^(?:${NONNEG})\\s*\\(.*\\)\\s*(>=|>|<>|!=)\\s*(-?\\d+(?:\\.\\d+)?)$`).exec(s)
-  if (nn) {
-    const op = nn[1], n = parseFloat(nn[2])
-    if (op === '>=') return n <= 0          // r >= n holds for all r >= 0 when n <= 0
-    if (op === '>') return n < 0            // r >  n holds for all r >= 0 when n <  0
-    if (op === '<>' || op === '!=') return n < 0 // r is never negative
-  }
-  return false
-}
-
-/** Split on commas at paren-depth 0 (for an `IN (a, b, c)` list). */
-function splitTopLevelCommas(q) {
-  const parts = []
-  let depth = 0
-  let last = 0
-  for (let i = 0; i < q.length; i++) {
-    if (q[i] === '(') depth++
-    else if (q[i] === ')') depth--
-    else if (depth === 0 && q[i] === ',') { parts.push(q.slice(last, i)); last = i + 1 }
-  }
-  parts.push(q.slice(last))
-  return parts
-}
-
-/** Split a boolean expression on `OR` at paren-depth 0. */
-function splitTopLevelOr(q) {
-  const parts = []
-  let depth = 0
-  let last = 0
-  for (let i = 0; i < q.length; i++) {
-    if (q[i] === '(') depth++
-    else if (q[i] === ')') depth--
-    else if (depth === 0 && q.startsWith(' or ', i)) { parts.push(q.slice(last, i)); i += 3; last = i + 1 }
-  }
-  parts.push(q.slice(last))
-  return parts.map((p) => p.trim())
-}
-
-/**
- * Does this qualifier always evaluate true, so it can't scope anything? A scope
- * token is neutralised when a tautology is OR-joined to it (`auth.uid() = owner
- * OR 2=2`) or IS the whole qualifier (`1=1`, `(true)`, `owner_id = owner_id`).
- * A tautology joined only by AND does NOT neutralise the scope, so we only look
- * at top-level OR disjuncts (and the whole expression).
+ * Does this qualifier always evaluate true, so it can't scope anything?
+ * Covers `true`, `1=1`, `owner_id = owner_id`, `NOT FALSE`, `NULL IS NULL`,
+ * `TRUE::bool`, `coalesce(true, …)`, `1 in (1)`, `length(x) >= 0`, and the same
+ * shapes nested inside any OR group.
  */
 export function isPermissiveTautology(qual) {
-  if (qual == null) return false
-  // isAlwaysTrueTerm handles the parens, the top-level OR split, AND the recursion
-  // into nested OR groups — one entry point covers `2=2`, `x OR 2=2`, `x OR (a OR 2=2)`.
-  return isAlwaysTrueTerm(String(qual).toLowerCase().replace(/\s+/g, ' ').trim())
-}
-
-/** Is this single term provably ALWAYS FALSE (`false`, `1=2`, `'a'='b'`)? Such a
- *  term contributes nothing to an OR, so it doesn't widen access. */
-function isAlwaysFalseTerm(term) {
-  const s = stripOuterParens(term)
-  if (s === 'false') return true
-  const cmp = /^(-?\d+(?:\.\d+)?|'[^']*')\s*(=|<>|!=|<=|>=|<|>)\s*(-?\d+(?:\.\d+)?|'[^']*')$/.exec(s)
-  if (!cmp) return false
-  const [, a, op, b] = cmp
-  const aStr = a.startsWith("'"), bStr = b.startsWith("'")
-  if (aStr !== bStr) return false
-  const va = aStr ? a : parseFloat(a)
-  const vb = bStr ? b : parseFloat(b)
-  switch (op) {
-    case '=': return va !== vb
-    case '<>': case '!=': return va === vb
-    case '<': return !(va < vb)
-    case '>': return !(va > vb)
-    case '<=': return !(va <= vb)
-    case '>=': return !(va >= vb)
-    default: return false
-  }
+  return coreIsTautology(qual)
 }
 
 /**
  * FAIL-SAFE for the tautology hydra: a policy is "safely scoped" only if EVERY
- * top-level OR disjunct itself restricts to the caller (realScope) or is provably
- * false. If ANY OR branch is something the engine can't prove restricts —
- * `auth.uid()=x OR status='published'`, `OR (1=1 AND 2=2)`, `OR deleted_at IS
- * NULL`, `OR coalesce(true,false)` — the OR WIDENS access, so we must NOT pass it
- * silently. Returns true → caller emits a WARN (not a silent green). This closes
- * the whole class instead of enumerating tautology forms one by one.
+ * top-level OR disjunct itself restricts to the caller or is provably false. If
+ * ANY branch can't be proven to restrict — `auth.uid()=x OR status='published'`,
+ * `OR is_public`, `OR coalesce(true,false)` — the OR WIDENS access, so the caller
+ * emits a WARN rather than a silent green. An unparseable qualifier counts as
+ * unproven, never as safe.
  */
 export function hasUnprovenOrBranch(qual) {
-  if (qual == null) return false
-  const disj = splitTopLevelOr(String(qual).toLowerCase().replace(/\s+/g, ' ').trim())
-  if (disj.length <= 1) return false
-  return !disj.every((d) => realScope(d) || isAlwaysFalseTerm(d))
+  return coreHasUnprovenOrBranch(qual)
 }
 
-// A token expression (auth.uid()/auth.jwt()/current_setting(...)) that is PRESENT
-// but does not RESTRICT — it holds for every caller, so it scopes nothing:
-//   `auth.uid() IS [NOT] NULL`      (true for anyone / any logged-in caller)
-//   `auth.uid() = auth.uid()`       (reflexive on the token)
-//   `auth.uid() IN (auth.uid())`    (self-membership)
-//   `auth.uid() = ANY(ARRAY[auth.uid()])`
-// realScope must reject these, or `auth.uid()=owner OR auth.uid() IS NOT NULL`
-// (every authenticated user reads the whole table) passes green — the token being
-// merely PRESENT is not proof it RESTRICTS.
-const TOKEN_EXPR = String.raw`auth\.uid\(\)|auth\.jwt\(\)|current_setting\(\s*'[^']*'\s*(?:,\s*(?:true|false)\s*)?\)`
-function isTokenTautology(qual) {
-  const s = stripOuterParens(String(qual).toLowerCase().replace(/\s+/g, ' ').trim())
-  const T = TOKEN_EXPR
-  if (new RegExp(`^(?:${T})\\s+is\\s+(?:not\\s+)?null$`).test(s)) return true
-  const eq = new RegExp(`^(${T})\\s*=\\s*(${T})$`).exec(s)
-  if (eq && eq[1] === eq[2]) return true
-  const inm = new RegExp(`^(${T})\\s+in\\s*\\(\\s*(${T})\\s*\\)$`).exec(s)
-  if (inm && inm[1] === inm[2]) return true
-  const anym = new RegExp(`^(${T})\\s*=\\s*any\\s*\\(\\s*array\\[\\s*(${T})\\s*\\]\\s*\\)$`).exec(s)
-  if (anym && anym[1] === anym[2]) return true
-  return false
-}
-
-/** The auth/session built-ins we understand precisely (a real, visible scope).
- *  Requires the token to RESTRICT (be compared to a per-row value), not merely be
- *  present — a token-only tautology (`auth.uid() IS NOT NULL`) does not scope. */
+/**
+ * A real, visible scope: the caller identity (auth.uid()/auth.jwt()/
+ * current_setting) COMPARED to a per-row value, or the backend-role restriction
+ * `auth.role() = 'service_role'`. Being merely PRESENT is not enough —
+ * `auth.uid() IS NOT NULL`, `auth.uid() = auth.uid()` and friends scope nothing.
+ * A data column compared to the string 'service_role' is NOT a backend
+ * restriction (that was a real false-negative in the regex engine).
+ */
 function realScope(qual) {
-  if (/'service_role'/i.test(qual)) return true // restricted to the backend role
-  if (!/auth\.uid\(\)|current_setting|auth\.jwt\(\)/i.test(qual)) return false
-  if (isTokenTautology(qual)) return false // present but not restrictive
-  return true
+  return restrictsToCallerQual(qual)
 }
 
 /**
  * First user-defined function call that could be a scoping helper — a static
  * scan can't see inside it, so it warrants a soft warn, not a pass or a hard
- * fail. Recognises ANY helper name (authorize(), belongs_to_org(), can_read(),
- * get_/is_/has_*), not just a fixed prefix. Ignores the built-ins we handle
- * precisely (auth.uid/jwt/role, current_setting) and the SQL keywords that take
- * parens (select/exists in subqueries). Returns null if none.
+ * fail. Built-ins we understand precisely (auth.*, current_setting, coalesce,
+ * length, …) are ignored. Returns null if none.
  */
 function helperCall(qual) {
-  const re = /\b((?:\w+\.)?\w+)\s*\(/g
-  // Ignore the built-ins we handle precisely, the SQL keywords that take parens
-  // (select/exists subqueries, the `in (…)` operator), and non-negative scalar
-  // built-ins that only appear inside constant/tautological predicates — none of
-  // these scope a row to the caller, so they must not read as a "real" helper.
-  const skip = new Set([
-    'auth.uid', 'auth.jwt', 'auth.role', 'current_setting', 'select', 'exists', 'in',
-    'length', 'char_length', 'character_length', 'octet_length', 'bit_length', 'cardinality',
-  ])
-  let m
-  while ((m = re.exec(qual)) !== null) {
-    if (!skip.has(m[1].toLowerCase())) return m[1]
-  }
-  return null
+  return helperCallQual(qual)
 }
 
 /**
  * Does this policy qualifier scope access (so it's not an open anon read)?
- * Recognises the real Supabase patterns:
- *  - per-user: auth.uid() / current_setting / auth.jwt()
- *  - restricted to a backend role: auth.role() = 'service_role' (NOT
- *    'authenticated'/'anon' — those stay flagged as role-only)
- *  - scoping through a helper function of ANY name (see helperCall)
- * A tautology (`... OR true`, `1=1`) never counts as scoped, even when a scope
- * token is also present.
+ *  - per-user: the caller token compared to a row value
+ *  - restricted to the backend role: auth.role() = 'service_role'
+ *  - scoping through a helper function of any name (see helperCall)
+ * A tautology never counts as scoped, even when a scope token is also present.
  */
 export function isScoped(qual) {
   if (qual == null) return false
@@ -272,9 +106,10 @@ export function isScoped(qual) {
 }
 
 /**
- * If a policy is scoped ONLY through a helper function (no auth.uid()/service_role
- * we can see), return the helper name — a static scan can't tell whether the
- * helper actually restricts (is_public() would leak). Used to emit a soft warn.
+ * If a policy is scoped ONLY through a helper function (no auth.uid()/
+ * service_role we can see), return the helper name — a static scan can't tell
+ * whether the helper actually restricts (is_public() would leak). Used to emit
+ * a soft warn.
  */
 export function helperScope(qual) {
   if (qual == null) return null
@@ -282,6 +117,7 @@ export function helperScope(qual) {
   if (realScope(qual)) return null
   return helperCall(qual)
 }
+
 
 /** Roles that include the anonymous (public API) caller. */
 function includesAnon(roles = []) {
