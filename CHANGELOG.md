@@ -1,10 +1,12 @@
 # Changelog
 
-## Unreleased — BREAKING
+## 0.4.0 — 2026-07-20 — BREAKING
 
 Findings from the 20/07 re-audit. Each made the gate report a real exposure as a
-warning, or not at all, so CI green on 0.3.0 can go red here without the database
-having changed. Version number not yet assigned.
+warning, or not at all, so a green result on an earlier version can go red here
+without the database having changed. 0.4.0 is the first published build to carry
+these fixes AND the 0.3.0 changes below (0.3.0 was tagged but never released to
+npm, so upgrading from 0.2.x brings both).
 
 ### The gate no longer goes green under a least-privilege audit role
 
