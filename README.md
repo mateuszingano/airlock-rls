@@ -55,7 +55,12 @@ Airlock audits the *logic* of your policies, not just their presence.
    Also a fail for `authenticated`.
 7. **`anon_read_leak`** *(DAST)* — with an anon key, Airlock actually reads each
    table over the REST API; a returned row is a **proven** leak, not an inference.
-8. **`service_role_exposed`** — a Supabase **service key** shipped to the browser
+8. **`matview_exposed`** — a **materialized view** a client role can read. RLS
+   does not apply to a matview *at all*: `CREATE MATERIALIZED VIEW
+   public.all_payments AS SELECT * FROM payments` plus a grant to `anon` is a
+   full dump of the underlying table, no matter how correct the policies on
+   `payments` are.
+9. **`service_role_exposed`** — a Supabase **service key** shipped to the browser
    (a `service_role` JWT or an `sb_secret_...` key). It bypasses *every* RLS
    policy at once, so whoever reads it owns your database. Scanned straight from
    your deployed site — no database needed (see below).

@@ -523,8 +523,11 @@ export function buildResult({
 
   // Which tables carry each policy name? A name on more than one table cannot
   // be waived by its bare spelling.
+  // Storage policies count too: they carry policy names from the same namespace
+  // the author types into --allow, so leaving them out would let a bare name be
+  // treated as unique when it is not.
   const tablesByPolicyName = new Map()
-  for (const p of policies) {
+  for (const p of [...policies, ...storagePolicies.map((sp) => ({ ...sp, tablename: 'storage.objects' }))]) {
     const set = tablesByPolicyName.get(p.policyname) || new Set()
     set.add(p.tablename)
     tablesByPolicyName.set(p.policyname, set)
@@ -589,7 +592,7 @@ export function buildResult({
   // Storage object-level policies (storage.objects) — same logic, prefixed.
   for (const p of storagePolicies) {
     for (const f of classifyPolicy({ ...p, tablename: 'storage.objects' }, { grants: null, restrictives: [] })) {
-      if (policyAllowed(allowSet, p)) allowed.push(f)
+      if (policyAllowed(allowSet, { ...p, tablename: 'storage.objects' }, tablesByPolicyName)) allowed.push(f)
       else findings.push({ ...f, kind: 'storage_' + f.kind })
     }
   }

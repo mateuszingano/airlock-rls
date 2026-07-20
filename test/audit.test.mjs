@@ -937,3 +937,56 @@ test('#update an open USING is caught even when WITH CHECK is properly scoped', 
   // and a genuinely scoped policy stays clean
   assert.equal(R('UPDATE', SCOPED, SCOPED).findings.length, 0)
 })
+
+// The allow-list fix added a third argument to policyAllowed and the
+// storage.objects call site was not updated, so `airlock --allow <name>` on a
+// project with a storage policy of that name CRASHED the whole audit instead of
+// waiving one finding. The suite missed it because the only storagePolicies
+// test never passed `allow`.
+test('#allow storage policies go through the same allow-list, without crashing', () => {
+  const sp = [{ policyname: 'public_read', cmd: 'SELECT', roles: ['anon'], qual: 'true', with_check: null, permissive: 'PERMISSIVE' }]
+
+  const bare = buildResult({ schema: 'public', storagePolicies: sp, allow: new Set(['public_read']) })
+  assert.equal(bare.findings.length, 0, 'a unique bare name waives the storage finding')
+  assert.equal(bare.allowed.length, 1)
+
+  const qualified = buildResult({ schema: 'public', storagePolicies: sp, allow: new Set(['storage.objects.public_read']) })
+  assert.equal(qualified.findings.length, 0, 'and so does the qualified form')
+
+  assert.equal(buildResult({ schema: 'public', storagePolicies: sp }).findings.length, 1, 'without an allow it is still reported')
+
+  // Ambiguity spans both namespaces: a storage policy and a table policy of the
+  // same name must not let a bare token silence either one.
+  const shared = buildResult({
+    schema: 'public',
+    storagePolicies: sp,
+    policies: [{ tablename: 'payments', policyname: 'public_read', cmd: 'SELECT', roles: ['anon'], qual: 'true', with_check: null, permissive: 'PERMISSIVE' }],
+    allow: new Set(['public_read']),
+  })
+  assert.equal(shared.allowed.length, 0, 'an ambiguous bare name waives nothing')
+  assert.ok(shared.findings.some((f) => f.kind === 'allow_ambiguous'), 'and says so')
+})
+
+// update_using_unscoped was documented in the README with no test behind it.
+// The subtle rule: WITH CHECK constrains what the new row may LOOK like, but
+// USING decides which rows can be TARGETED. With an open USING, any row can be
+// taken over — and omitting WITH CHECK entirely used to look SAFER to the gate
+// than writing it, because the exclusion pointed at a branch that never ran.
+test('#update FOR UPDATE with an unscoped USING is a fail, with or without WITH CHECK', () => {
+  const upd = (over) => buildResult({
+    schema: 'public',
+    policies: [policy({ cmd: 'UPDATE', tablename: 'notes', ...over })],
+  })
+
+  for (const role of ['anon', 'authenticated']) {
+    const bare = upd({ roles: [role], qual: 'true', with_check: null })
+    assert.equal(bare.problems, 1, `${role}: open USING, no WITH CHECK must fail`)
+
+    const scopedCheck = upd({ roles: [role], qual: 'true', with_check: 'owner_id = auth.uid()' })
+    assert.equal(scopedCheck.problems, 1, `${role}: a scoped WITH CHECK does not rescue an open USING`)
+  }
+
+  // …and a properly scoped UPDATE stays silent.
+  const ok = upd({ roles: ['authenticated'], qual: 'owner_id = auth.uid()', with_check: 'owner_id = auth.uid()' })
+  assert.equal(ok.problems, 0, 'a scoped USING is fine')
+})
