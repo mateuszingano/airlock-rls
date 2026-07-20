@@ -119,19 +119,91 @@ export function helperScope(qual) {
 }
 
 
+/**
+ * Normalize a role list to lowercase, trimmed, quote-free strings.
+ *
+ * `pg_policies.roles` comes back lowercase from a live database, so the raw
+ * comparisons below worked for the `audit()` path — but `classifyPolicy` and
+ * `buildResult` are exported and documented as reusable (the monitor consumes
+ * them, and so could a migration parser or a .sql dump reader). Any caller
+ * feeding rows from another source hit silent misses: `['ANON']` matched
+ * nothing, so a wide-open policy classified as invisible. Note the author DID
+ * normalize `permissive` (isRestrictive upper-cases it) and simply didn't carry
+ * that through to cmd/roles — asymmetry, not intent.
+ */
+function normRoles(roles = []) {
+  // `pg_policies.roles` is `name[]` (OID 1003), and node-pg has NO parser
+  // registered for that type — it hands back the raw wire string `"{anon}"`,
+  // never a JS array.
+  //
+  // The original code was `roles.includes('anon')`, which worked by ACCIDENT:
+  // String.prototype.includes did a substring match on `"{anon}"`. Wrapping a
+  // non-array in `[roles]` turned that accident into exact equality against the
+  // literal `"{anon}"`, and every role check silently returned false — which
+  // made EVERY policy rule a no-op against a real database. Proven end to end:
+  // a payments table with `FOR SELECT TO anon USING (true)` audited clean while
+  // anon read the card numbers.
+  //
+  // So parse the wire form explicitly instead of relying on either accident.
+  const list = Array.isArray(roles)
+    ? roles
+    : String(roles ?? '')
+        .replace(/^\{|\}$/g, '') // {anon,authenticated} → anon,authenticated
+        .split(',')
+  return list.map((r) => String(r ?? '').replace(/"/g, '').trim().toLowerCase()).filter(Boolean)
+}
+
+/** Normalize a policy command to the upper-case form the command sets use. */
+function normCmd(cmd) {
+  return String(cmd ?? '').trim().toUpperCase()
+}
+
 /** Roles that include the anonymous (public API) caller. */
 function includesAnon(roles = []) {
-  return roles.includes('anon') || roles.includes('public')
+  const r = normRoles(roles)
+  return r.includes('anon') || r.includes('public')
 }
 function includesAuthenticated(roles = []) {
-  return roles.includes('authenticated') || roles.includes('public')
+  const r = normRoles(roles)
+  return r.includes('authenticated') || r.includes('public')
 }
 
 const READ_CMDS = new Set(['SELECT', 'ALL'])
 const WRITE_CMDS = new Set(['INSERT', 'UPDATE', 'ALL'])
+// DELETE was in NEITHER set, so `FOR DELETE` fell through every branch and
+// produced zero findings: `CREATE POLICY d ON payments FOR DELETE TO anon
+// USING (true)` passed the gate green while letting anyone with the anon key
+// empty the table. It needs its own set because it is neither a read nor a
+// write in the WITH CHECK sense — DELETE has no WITH CHECK at all; the USING
+// expression alone decides which rows may be destroyed.
+const DELETE_CMDS = new Set(['DELETE', 'ALL'])
 
 function isRestrictive(p) {
   return String(p.permissive).toUpperCase() === 'RESTRICTIVE'
+}
+
+/**
+ * Is this policy waved through by the allow-list?
+ *
+ * Policy names are unique PER TABLE in Postgres, not per schema — `public_read`
+ * on a status page and `public_read` on `payments` are different objects that
+ * happen to share a name. Matching on the bare name silenced both: allow-listing
+ * the intentionally-public status page also muted a real finding on payments,
+ * and would keep muting it as new tables reused the name.
+ *
+ * Accepts `table.policy` (qualified, always unambiguous) and the bare `policy`
+ * (kept for compatibility, and correct whenever the name is used once).
+ */
+function policyAllowed(allowSet, p, tablesByPolicyName) {
+  if (allowSet.has(`${p.tablename}.${p.policyname}`)) return true
+  // A bare policy name is only unambiguous when exactly one table carries it.
+  // "public_read" is a name people reuse on every table; honouring it bare
+  // would silence tables the author never looked at. When it is ambiguous we
+  // refuse to apply it and say so (see `allow_ambiguous`), rather than
+  // silently waiving findings across the schema.
+  if (!allowSet.has(p.policyname)) return false
+  const tables = tablesByPolicyName.get(p.policyname)
+  return tables ? tables.size === 1 : false
 }
 
 /**
@@ -172,20 +244,27 @@ export function classifyPolicy(p, ctx = {}) {
   // A RESTRICTIVE policy only narrows access — it can never be the cause of a leak.
   if (isRestrictive(p)) return []
 
+  // Normalize the command ONCE, up front, and use it everywhere below — the raw
+  // `cmd` was compared against upper-case sets, so a lower-case 'select' from
+  // any non-pg_policies source silently matched no branch at all.
+  const cmd = normCmd(p.cmd)
   const object = `${p.tablename}."${p.policyname}"`
   const out = []
   const taut = isPermissiveTautology(p.qual)
   const scoped = isScoped(p.qual) // false when taut (isScoped short-circuits on tautology)
-  const readish = READ_CMDS.has(p.cmd)
-  const writeish = WRITE_CMDS.has(p.cmd)
+  const readish = READ_CMDS.has(cmd)
+  const writeish = WRITE_CMDS.has(cmd)
+  const deleteish = DELETE_CMDS.has(cmd)
 
   // Which roles this policy actually exposes for reads/writes (role applies AND
   // the role holds the matching table GRANT — no grant means no exposure).
   const anonRead = includesAnon(p.roles) && hasGrant(grants, 'anon', 'SELECT')
   const authRead = includesAuthenticated(p.roles) && hasGrant(grants, 'authenticated', 'SELECT')
-  const writePriv = p.cmd === 'UPDATE' ? 'UPDATE' : 'INSERT'
+  const writePriv = cmd === 'UPDATE' ? 'UPDATE' : 'INSERT'
   const anonWrite = includesAnon(p.roles) && hasGrant(grants, 'anon', writePriv)
   const authWrite = includesAuthenticated(p.roles) && hasGrant(grants, 'authenticated', writePriv)
+  const anonDelete = includesAnon(p.roles) && hasGrant(grants, 'anon', 'DELETE')
+  const authDelete = includesAuthenticated(p.roles) && hasGrant(grants, 'authenticated', 'DELETE')
 
   // 1) Read side. A literal `true`, a tautology (`... OR true`, `1=1`), or any
   // non-scoping qualifier all expose rows.
@@ -193,21 +272,29 @@ export function classifyPolicy(p, ctx = {}) {
     const literal = p.qual === 'true' || taut
     const how = p.qual === 'true' ? 'USING(true)' : `USING (${short(p.qual)}) always evaluates true`
     if (anonRead) {
-      const saved = restrictiveScopes(restrictives, p.cmd, 'anon')
+      const saved = restrictiveScopes(restrictives, cmd, 'anon')
       out.push({
         kind: literal ? 'permissive_true' : 'anon_unscoped',
         severity: saved ? 'warn' : 'fail',
         object,
         detail: literal
-          ? `[${p.cmd}] ${how} — anon reads every row${saved ? ' (a restrictive policy narrows it — verify)' : ''}`
-          : `[${p.cmd}] anon reads without scoping to a user — USING (${short(p.qual)})${saved ? ' (restrictive-narrowed — verify)' : ''}`,
+          ? `[${cmd}] ${how} — anon reads every row${saved ? ' (a restrictive policy narrows it — verify)' : ''}`
+          : `[${cmd}] anon reads without scoping to a user — USING (${short(p.qual)})${saved ? ' (restrictive-narrowed — verify)' : ''}`,
       })
     } else if (authRead) {
+      const saved = restrictiveScopes(restrictives, cmd, 'authenticated')
       out.push({
         kind: literal ? 'permissive_true' : 'authenticated_unscoped',
-        severity: 'warn',
+        // A LITERAL always-true for `authenticated` is a fail, not a nudge: in
+        // any multi-tenant app it means every signed-up user reads every other
+        // tenant's rows, which is the textbook IDOR. It used to be a warn, and
+        // since warns never broke the build, the gate went green on it.
+        // A merely UNSCOPED (not provably always-true) qualifier stays a warn —
+        // there the scan genuinely can't tell intent. Both are allow-listable
+        // when the openness is deliberate (a shared feed, a public directory).
+        severity: literal && !saved ? 'fail' : 'warn',
         object,
-        detail: `[${p.cmd}] any authenticated user reads all rows${literal ? ` — ${how}` : ` (no auth.uid()) — USING (${short(p.qual)})`}`,
+        detail: `[${cmd}] any authenticated user reads all rows${literal ? ` — ${how}` : ` (no auth.uid()) — USING (${short(p.qual)})`}${saved ? ' (restrictive-narrowed — verify)' : ''}`,
       })
     }
   }
@@ -227,7 +314,7 @@ export function classifyPolicy(p, ctx = {}) {
         kind: 'helper_scoped',
         severity: 'warn',
         object,
-        detail: `[${p.cmd}] ${who} read is scoped only through ${helper}() — a static scan can't see inside it; verify it restricts the caller${prove}`,
+        detail: `[${cmd}] ${who} read is scoped only through ${helper}() — a static scan can't see inside it; verify it restricts the caller${prove}`,
       })
     }
   }
@@ -244,7 +331,7 @@ export function classifyPolicy(p, ctx = {}) {
       kind: 'or_branch_unscoped',
       severity: 'warn',
       object,
-      detail: `[${p.cmd}] scoped by auth.uid() but an OR branch widens it — ${who} may read rows outside the caller: USING (${short(p.qual)}). Prove the branch restricts (add --url/--anon-key) or allow-list if it's intentional public sharing.`,
+      detail: `[${cmd}] scoped by auth.uid() but an OR branch widens it — ${who} may read rows outside the caller: USING (${short(p.qual)}). Prove the branch restricts (add --url/--anon-key) or allow-list if it's intentional public sharing.`,
     })
   }
 
@@ -253,13 +340,13 @@ export function classifyPolicy(p, ctx = {}) {
   if (writeish && (anonWrite || authWrite)) {
     const wc = p.with_check
     const wcTaut = wc === 'true' || isPermissiveTautology(wc)
-    const saved = restrictiveScopes(restrictives, p.cmd, anonWrite ? 'anon' : 'authenticated')
+    const saved = restrictiveScopes(restrictives, cmd, anonWrite ? 'anon' : 'authenticated')
     if (wcTaut) {
       out.push({
         kind: 'permissive_true',
         severity: saved ? 'warn' : 'fail',
         object,
-        detail: `[${p.cmd}] WITH CHECK(${wc === 'true' ? 'true' : short(wc)}) always passes — writes are not tied to the caller (a row can be forged as anyone)${saved ? ' (restrictive-narrowed — verify)' : ''}`,
+        detail: `[${cmd}] WITH CHECK(${wc === 'true' ? 'true' : short(wc)}) always passes — writes are not tied to the caller (a row can be forged as anyone)${saved ? ' (restrictive-narrowed — verify)' : ''}`,
       })
     } else if (wc != null && wc !== '' && !isScoped(wc)) {
       // A WITH CHECK is present but doesn't scope the new row to the caller, so
@@ -269,17 +356,93 @@ export function classifyPolicy(p, ctx = {}) {
         kind: 'write_unscoped',
         severity: anonWrite && !saved ? 'fail' : 'warn',
         object,
-        detail: `[${p.cmd}] WITH CHECK (${short(wc)}) doesn't tie the row to the caller — ${anonWrite ? 'anon' : 'any authenticated user'} can forge rows as another tenant${saved ? ' (restrictive-narrowed — verify)' : ''}`,
+        detail: `[${cmd}] WITH CHECK (${short(wc)}) doesn't tie the row to the caller — ${anonWrite ? 'anon' : 'any authenticated user'} can forge rows as another tenant${saved ? ' (restrictive-narrowed — verify)' : ''}`,
       })
-    } else if ((wc == null || wc === '') && !scoped && p.qual !== 'true' && !taut) {
+    } else if ((wc == null || wc === '') && !scoped) {
       // When WITH CHECK is omitted, Postgres uses the USING expression as the
-      // check for new/updated rows. So this is only an unguarded write when
-      // USING doesn't scope (and isn't a literal-true/tautology case, already flagged).
+      // check for new/updated rows — so an unscoped USING is an unguarded write.
+      //
+      // This branch used to carry `&& p.qual !== 'true' && !taut`, excluding the
+      // WORST case on the grounds that a literal-true USING was "already flagged
+      // above". It wasn't: the read branch is gated on READ_CMDS, and UPDATE is
+      // not a READ_CMD. The exclusion pointed at a flag that never fired, so
+      // `FOR UPDATE TO anon USING (true)` with no WITH CHECK produced zero
+      // findings — while the SAME policy written with an explicit
+      // `WITH CHECK (true)` was caught. Writing less SQL looked safer to the
+      // gate than writing more.
+      const literalUsing = p.qual === 'true' || taut
+      const how = p.qual === 'true' ? 'USING(true)' : `USING (${short(p.qual)}) always evaluates true`
       out.push({
-        kind: 'write_unchecked',
-        severity: 'warn',
+        kind: literalUsing ? 'permissive_true' : 'write_unchecked',
+        // A tautological USING with no WITH CHECK means anyone addressed by the
+        // policy can rewrite any row: that is a fail, not a nudge. A merely
+        // unscoped (but not always-true) USING stays a warn for anon, as before.
+        severity: literalUsing && !saved ? 'fail' : 'warn',
         object,
-        detail: `[${p.cmd}] no WITH CHECK and USING doesn't scope to the caller — writes aren't tied to the tenant`,
+        detail: literalUsing
+          ? `[${cmd}] ${how} and no WITH CHECK — Postgres applies USING as the check, so ${anonWrite ? 'anon' : 'any authenticated user'} can rewrite ANY row${saved ? ' (restrictive-narrowed — verify)' : ''}`
+          : `[${cmd}] no WITH CHECK and USING doesn't scope to the caller — writes aren't tied to the tenant`,
+      })
+    }
+  }
+
+  // 3) Delete side. DELETE has no WITH CHECK — the USING expression alone
+  // decides which rows can be destroyed. An always-true or unscoped USING means
+  // the addressed role can empty the table.
+  //
+  // `authenticated` is a FAIL here, not the warn it gets for reads: letting any
+  // logged-in user delete another tenant's rows is destructive and
+  // irreversible, which is strictly worse than letting them read those rows.
+  if (deleteish && (p.qual === 'true' || taut || (p.qual != null && !scoped))) {
+    const literal = p.qual === 'true' || taut
+    const how = p.qual === 'true' ? 'USING(true)' : `USING (${short(p.qual)}) always evaluates true`
+    const saved = restrictiveScopes(restrictives, cmd, anonDelete ? 'anon' : 'authenticated')
+    if (anonDelete || authDelete) {
+      const who = anonDelete ? 'anon (anyone with the public key)' : 'any authenticated user'
+      out.push({
+        kind: literal ? 'permissive_true' : 'delete_unscoped',
+        severity: saved ? 'warn' : 'fail',
+        object,
+        detail: `[DELETE] ${literal ? how : `USING (${short(p.qual)}) doesn't scope to the caller`} — ${who} can delete rows they don't own${saved ? ' (restrictive-narrowed — verify)' : ''}`,
+      })
+    }
+  }
+
+  // 4) UPDATE row TARGETING. `USING` and `WITH CHECK` answer different questions:
+  // USING decides WHICH EXISTING ROWS the caller may update, WITH CHECK decides
+  // what the resulting row may look like. A correct WITH CHECK does not make an
+  // open USING safe.
+  //
+  // The write branch above only inspects USING when WITH CHECK is absent, so a
+  // policy with a properly scoped WITH CHECK and `USING (true)` produced ZERO
+  // findings — and that combination is a complete tenant takeover, proven on
+  // Postgres:
+  //
+  //   CREATE POLICY upd ON notes FOR UPDATE TO app
+  //     USING (true) WITH CHECK (owner = current_user);
+  //   -- as bob, with no WHERE clause:
+  //   UPDATE notes SET owner = 'bob', body = 'PWNED';   -- UPDATE 2  (alice's rows)
+  //
+  // Every row is targetable because USING is true, and each rewritten row passes
+  // the check because bob sets himself as owner. Note the perverse inversion the
+  // old shape produced: writing the CORRECT WITH CHECK blinded the gate, while
+  // writing `WITH CHECK (true)` was caught.
+  const updateish = cmd === 'UPDATE' || cmd === 'ALL'
+  if (updateish && (p.qual === 'true' || taut || (p.qual != null && !scoped))) {
+    const literal = p.qual === 'true' || taut
+    const saved = restrictiveScopes(restrictives, cmd, anonWrite ? 'anon' : 'authenticated')
+    // Only report here when the write branch did NOT already speak about this
+    // policy (it handles the missing/permissive WITH CHECK cases).
+    const alreadyReported = out.some((f) => f.detail.startsWith(`[${cmd}]`))
+    if ((anonWrite || authWrite) && !alreadyReported) {
+      const who = anonWrite ? 'anon (anyone with the public key)' : 'any authenticated user'
+      out.push({
+        kind: 'update_using_unscoped',
+        // Row takeover destroys data and is irreversible, so `authenticated` is
+        // a fail here for the same reason DELETE is.
+        severity: saved ? 'warn' : 'fail',
+        object,
+        detail: `[${cmd}] USING (${short(p.qual)})${literal ? ' always evaluates true' : " doesn't scope to the caller"} — ${who} can target ANY row for update. A scoped WITH CHECK only constrains the new value; it does not stop the row from being taken over${saved ? ' (restrictive-narrowed — verify)' : ''}`,
       })
     }
   }
@@ -311,10 +474,12 @@ export function buildResult({
   publicBuckets = [],
   secDefFns = [],
   views = [],
+  matviews = [],
   storagePolicies = [],
   realtimeTables = [],
   grants = null,
   allow = new Set(),
+  skipped = [],
 } = {}) {
   const allowSet = allow instanceof Set ? allow : new Set(allow)
 
@@ -356,13 +521,36 @@ export function buildResult({
     })
   }
 
+  // Which tables carry each policy name? A name on more than one table cannot
+  // be waived by its bare spelling.
+  const tablesByPolicyName = new Map()
+  for (const p of policies) {
+    const set = tablesByPolicyName.get(p.policyname) || new Set()
+    set.add(p.tablename)
+    tablesByPolicyName.set(p.policyname, set)
+  }
+
   const allowed = []
   for (const p of policies) {
     const ctx = { grants: grantsFor(p.tablename), restrictives: restrictivesByTable[p.tablename] || [] }
     for (const f of classifyPolicy(p, ctx)) {
-      if (allowSet.has(p.policyname)) allowed.push(f)
+      if (policyAllowed(allowSet, p, tablesByPolicyName)) allowed.push(f)
       else findings.push(f)
     }
+  }
+
+  // Tell the author when an --allow entry did not apply, instead of leaving
+  // them to believe a finding was waived.
+  for (const entry of allowSet) {
+    if (entry.includes('.')) continue
+    const tables = tablesByPolicyName.get(entry)
+    if (!tables || tables.size < 2) continue
+    findings.push({
+      kind: 'allow_ambiguous',
+      severity: 'warn',
+      object: entry,
+      detail: `--allow ${entry} was NOT applied: ${tables.size} tables carry a policy named "${entry}" (${[...tables].sort().join(', ')}). Qualify the one you mean, e.g. --allow ${[...tables].sort()[0]}.${entry}`,
+    })
   }
 
   // Coverage beyond RLS policies.
@@ -401,7 +589,7 @@ export function buildResult({
   // Storage object-level policies (storage.objects) — same logic, prefixed.
   for (const p of storagePolicies) {
     for (const f of classifyPolicy({ ...p, tablename: 'storage.objects' }, { grants: null, restrictives: [] })) {
-      if (allowSet.has(p.policyname)) allowed.push(f)
+      if (policyAllowed(allowSet, p)) allowed.push(f)
       else findings.push({ ...f, kind: 'storage_' + f.kind })
     }
   }
@@ -434,9 +622,72 @@ export function buildResult({
       else findings.push(f)
     }
   }
+  // Materialized views: RLS has no effect on them whatsoever, so any client-role
+  // grant is a full dump of whatever the matview selects. This is a FAIL, not a
+  // warn — unlike a plain view, there is no `security_invoker` switch that could
+  // make it safe. The only fixes are revoking the grant or moving it out of the
+  // exposed schema.
+  for (const mv of matviews) {
+    if (!mv.anon_select && !mv.auth_select) continue
+    const who = mv.anon_select ? 'anon (anyone with the public key)' : 'any authenticated user'
+    const f = {
+      kind: 'matview_exposed',
+      severity: 'fail',
+      object: `matview:${mv.matviewname}`,
+      detail: `RLS does not apply to materialized views — ${who} can SELECT every row it holds. Revoke the grant, or move it to a schema PostgREST does not expose.`,
+    }
+    if (allowSet.has(mv.matviewname)) allowed.push(f)
+    else findings.push(f)
+  }
 
   // fail before warn, stable otherwise
   findings.sort((a, b) => (a.severity === b.severity ? 0 : a.severity === 'fail' ? -1 : 1))
+
+  // NOTHING AUDITED IS NOT THE SAME AS NOTHING WRONG.
+  // Every catalog query filters on `schemaname = $1`, so a schema that does not
+  // exist (a typo like `pubic`, or tables that moved to `app` while the workflow
+  // still points at `public`) returns zero rows everywhere — and zero rows means
+  // zero findings, which used to render as "✓ No RLS problems". The gate would
+  // stay green forever while auditing nothing at all. Fail instead: a gate must
+  // never report on a target it did not read.
+  // The condition is "the catalog came back empty ACROSS THE BOARD" — not just
+  // "no tables". If any query returned a row (a policy, a bucket, a function, a
+  // view), we did read the database and the result means something. Only when
+  // every single one is empty is it indistinguishable from having audited the
+  // wrong target, which is the failure this guards (a wrong schema empties every
+  // query at once — proven). Stating it this way also keeps focused unit tests
+  // able to exercise one classifier without staging an entire schema.
+  const readNothing =
+    allTables.length === 0 &&
+    policies.length === 0 &&
+    noRls.length === 0 &&
+    publicBuckets.length === 0 &&
+    secDefFns.length === 0 &&
+    views.length === 0 &&
+    storagePolicies.length === 0 &&
+    realtimeTables.length === 0 &&
+    matviews.length === 0
+  if (readNothing) {
+    findings.unshift({
+      kind: 'nothing_audited',
+      severity: 'fail',
+      object: schema,
+      detail: `no tables or policies found in schema "${schema}" — nothing was audited`,
+      fix: `Check the --schema value (and that the audit role can see it). An empty or misspelled schema is not proof that your RLS is correct.`,
+    })
+  }
+
+  // A check that could not RUN is not a check that passed. Surface each one as a
+  // warn so it appears in the report instead of vanishing — the caller can
+  // escalate with --fail-on warn when a complete audit is required.
+  for (const s of skipped) {
+    findings.push({
+      kind: 'check_skipped',
+      severity: 'warn',
+      object: s.check,
+      detail: `this check did not run (${s.reason}) — its result is UNKNOWN, not clean. Grant the audit role read access, or re-run with a role that has it.`,
+    })
+  }
 
   const problems = findings.filter((f) => f.severity === 'fail').length
   const warnings = findings.filter((f) => f.severity === 'warn').length
@@ -445,6 +696,7 @@ export function buildResult({
     schema,
     findings,
     allowed,
+    skipped,
     problems,
     warnings,
     passed: problems === 0,
@@ -517,35 +769,50 @@ export async function audit({ dbUrl, schema = 'public', allow = [] } = {}) {
     // code is the real danger).
     const { rows: secDefFns } = await client.query(
       `select p.proname,
-              has_function_privilege('anon', p.oid, 'EXECUTE') as anon_exec,
-              has_function_privilege('authenticated', p.oid, 'EXECUTE') as auth_exec
+              coalesce(to_regrole('anon') is not null and has_function_privilege('anon', p.oid, 'EXECUTE'), false) as anon_exec,
+              coalesce(to_regrole('authenticated') is not null and has_function_privilege('authenticated', p.oid, 'EXECUTE'), false) as auth_exec
          from pg_proc p join pg_namespace n on n.oid = p.pronamespace
         where n.nspname = $1 and p.prosecdef = true
         order by p.proname`,
       [schema]
     )
+    // Optional checks that only exist on a Supabase database. Two very different
+    // failures used to collapse into the same empty array:
+    //   · 42P01 undefined_table  — "storage schema isn't here" (plain Postgres).
+    //     Benign: there is genuinely nothing to audit.
+    //   · 42501 insufficient_privilege — "you may not read this". The check did
+    //     NOT RUN, and the report said nothing, so a CI using a restricted role
+    //     (good practice!) got a green result while a public bucket stayed
+    //     invisible forever.
+    // Silence is only acceptable for the first. Everything else is recorded and
+    // surfaced, because a gate must say which checks it could not perform.
+    const skipped = []
+    const optional = async (name, run) => {
+      try {
+        return await run()
+      } catch (err) {
+        if (err?.code === '42P01') return [] // object absent — nothing to audit
+        skipped.push({ check: name, reason: err?.code ? `${err.code} ${err.message}` : String(err?.message || err) })
+        return []
+      }
+    }
+
     // Storage object-level RLS (policies on storage.objects).
-    let storagePolicies = []
-    try {
+    const storagePolicies = await optional('storage.objects policies', async () => {
       const { rows } = await client.query(
         `select tablename, policyname, cmd, roles, qual, with_check, permissive
            from pg_policies where schemaname = 'storage' and tablename = 'objects'`
       )
-      storagePolicies = rows
-    } catch {
-      storagePolicies = []
-    }
+      return rows
+    })
     // Realtime: tables published to the supabase_realtime publication.
-    let realtimeTables = []
-    try {
+    const realtimeTables = await optional('realtime publication', async () => {
       const { rows } = await client.query(
         `select tablename from pg_publication_tables where pubname = 'supabase_realtime' and schemaname = $1`,
         [schema]
       )
-      realtimeTables = rows
-    } catch {
-      realtimeTables = []
-    }
+      return rows
+    })
     // Views that bypass RLS (security_invoker off = runs as owner).
     const { rows: views } = await client.query(
       `select c.relname as viewname,
@@ -556,17 +823,29 @@ export async function audit({ dbUrl, schema = 'public', allow = [] } = {}) {
         order by c.relname`,
       [schema]
     )
+    // MATERIALIZED views (relkind 'm'). RLS does not apply to a matview AT ALL —
+    // there is no policy mechanism for them — so one built over a protected table
+    // and granted to a client role is a complete, permanent dump of that table.
+    // `pg_tables` and the relkind='v' query above both exclude them, so this was
+    // a total blind spot: `CREATE MATERIALIZED VIEW public.everything AS SELECT *
+    // FROM private_t` + `GRANT SELECT TO anon` audited perfectly clean.
+    const { rows: matviews } = await client.query(
+      `select c.relname as matviewname,
+              coalesce(to_regrole('anon') is not null and has_table_privilege('anon', c.oid, 'SELECT'), false) as anon_select,
+              coalesce(to_regrole('authenticated') is not null and has_table_privilege('authenticated', c.oid, 'SELECT'), false) as auth_select
+         from pg_class c join pg_namespace n on n.oid = c.relnamespace
+        where n.nspname = $1 and c.relkind = 'm'
+        order by c.relname`,
+      [schema]
+    )
     // Public storage buckets (Supabase only — guarded for plain Postgres).
-    let publicBuckets = []
-    try {
+    const publicBuckets = await optional('storage.buckets', async () => {
       const { rows } = await client.query(
         `select id, name from storage.buckets where public = true order by id`
       )
-      publicBuckets = rows
-    } catch {
-      publicBuckets = [] // no storage schema (not a Supabase DB) — skip
-    }
-    return buildResult({ schema, noRls, policies, allTables, publicBuckets, secDefFns, views, storagePolicies, realtimeTables, grants, allow })
+      return rows
+    })
+    return buildResult({ schema, noRls, policies, allTables, publicBuckets, secDefFns, views, matviews, storagePolicies, realtimeTables, grants, allow, skipped })
   } finally {
     await client.end()
   }

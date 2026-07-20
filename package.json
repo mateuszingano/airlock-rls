@@ -18,12 +18,13 @@
     "bin",
     "src",
     "README.md",
+    "SECURITY.md",
     "LICENSE"
   ],
   "scripts": {
     "start": "node bin/airlock.mjs",
     "test": "node --test",
-    "prepublishOnly": "node --test"
+    "prepublishOnly": "node scripts/prepublish-gate.mjs"
   },
   "keywords": [
     "supabase",

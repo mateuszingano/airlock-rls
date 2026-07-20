@@ -43,9 +43,19 @@ Airlock audits the *logic* of your policies, not just their presence.
    (no `auth.uid()`) — everyone reads every row, even when it isn't literally `true`.
 4. **`write_unscoped`** — an anon INSERT/UPDATE whose `WITH CHECK` is present but
    doesn't tie the new row to the caller — anyone can forge rows as another tenant.
-5. **`anon_read_leak`** *(DAST)* — with an anon key, Airlock actually reads each
+5. **`delete_unscoped`** — a `FOR DELETE` policy whose `USING` doesn't scope to the
+   caller, so anyone the policy applies to can delete rows they don't own. Unlike
+   a read, this is a **fail for `authenticated` too**: destroying another tenant's
+   data is worse than reading it, and it isn't reversible.
+6. **`update_using_unscoped`** — a `FOR UPDATE` policy whose `USING` doesn't scope
+   to the caller. The subtle one: a scoped `WITH CHECK` constrains what the new
+   row may *look like*, but `USING` is what decides which rows can be **targeted**.
+   With an open `USING`, any row can be taken over — and writing *less* SQL (no
+   `WITH CHECK` at all) used to look safer to the gate than writing it explicitly.
+   Also a fail for `authenticated`.
+7. **`anon_read_leak`** *(DAST)* — with an anon key, Airlock actually reads each
    table over the REST API; a returned row is a **proven** leak, not an inference.
-6. **`service_role_exposed`** — a Supabase **service key** shipped to the browser
+8. **`service_role_exposed`** — a Supabase **service key** shipped to the browser
    (a `service_role` JWT or an `sb_secret_...` key). It bypasses *every* RLS
    policy at once, so whoever reads it owns your database. Scanned straight from
    your deployed site — no database needed (see below).
@@ -71,8 +81,35 @@ Airlock audits the *logic* of your policies, not just their presence.
 - **`security_definer`** — a function that runs as its owner and can bypass RLS.
 
 **What it does NOT cover yet (declared, not silently missed):**
+- **`FORCE ROW LEVEL SECURITY` is never read** — only `rowsecurity`. A table
+  whose owner is reachable keeps a silent bypass.
+- **`--site` does not defeat DNS rebinding.** Literal private, loopback,
+  link-local and metadata addresses are refused (including their IPv4-mapped
+  IPv6 spellings), and every fetch has a timeout and a body cap — but a hostname
+  that *resolves* to a private address is not caught, because the check runs on
+  the URL, not on the resolved socket.
+- **Checks that could not run are reported, not assumed clean.** If the audit
+  role lacks permission to read `storage.buckets`, the realtime publication or
+  storage policies, each one is surfaced as `check_skipped` with its reason. A
+  clean report means "I looked", not "I could not look".
+- **One schema per run.** Other schemas exposed through PostgREST are not
+  audited. A schema with nothing in it now *fails* rather than passing green,
+  but that only catches the typo, not the second schema you forgot to scan.
+- An **unscoped but not provably-true** qualifier for `authenticated` (e.g.
+  `USING (org = 'acme')`) is a **warn**, not a fail — there the scan genuinely
+  cannot tell whether the openness is intended. Gate it with `--fail-on warn`.
+  A *provable* tautology for `authenticated` **is** a fail.
 - Custom database roles beyond `anon`/`authenticated`/`public` in a `USING(true)`
   policy — whether a custom role is client-reachable is undecidable statically.
+- **`ALTER POLICY` is not read.** Airlock audits the policies as the database
+  currently holds them (`pg_policies`), which is the end state — but if you are
+  looking for a *migration-time* gate on a policy being loosened, that is
+  `migration-guard`'s job, not this one.
+- **A bare `--allow` name is refused when it is ambiguous.** Policy names are
+  unique per table, not per schema, so `--allow public_read` is only applied when
+  exactly one table carries that name. When two or more do, nothing is silenced
+  and an `allow_ambiguous` warn tells you the qualified form to use. This is a
+  deliberate refusal, not a miss.
 - A `WITH CHECK` scoped *only* through a helper function is treated as scoped
   (same "can't see inside" limit as reads) — use the DAST write probe to prove it.
 
@@ -167,8 +204,14 @@ Get the URL from `supabase status` (local) or your project's connection string.
 ### Options
 
 ```
+--fail-on <level>  What breaks the build: "fail" (default) or "warn". Several
+                   rules emit warn — including an authenticated tenant leak —
+                   so without this they are printed, never enforced.
+                   (also read from $RLS_AUDIT_FAIL_ON).
+--strict           Alias for --fail-on warn.
 --allow <names>    Policy names to treat as intentionally permissive
-                   (also read from $RLS_AUDIT_ALLOW).
+                   (also read from $RLS_AUDIT_ALLOW). Prefer "table.policy":
+                   a bare name applies only when one table carries it.
 --schema <name>    Schema to audit (default: public).
 --url URL          Supabase project URL — enables the DAST pass ($SUPABASE_URL).
 --anon-key VALUE   Public anon key for the DAST pass ($SUPABASE_ANON_KEY).

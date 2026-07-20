@@ -39,8 +39,16 @@ Arguments:
   DB_URL             Postgres connection string. Falls back to $SUPABASE_DB_URL.
 
 Options:
+  --fail-on <level>  What breaks the build: "fail" (default) or "warn". Most
+                     rules here emit warn (including an authenticated tenant
+                     leak) — without this flag they can only be printed, never
+                     enforced. Also read from $RLS_AUDIT_FAIL_ON.
+  --strict           Alias for --fail-on warn.
   --allow <names>    Comma-separated policy names to treat as intentionally
-                     permissive (also read from $RLS_AUDIT_ALLOW).
+                     permissive (also read from $RLS_AUDIT_ALLOW). Prefer the
+                     qualified form "table.policy": a bare name is only applied
+                     when exactly one table carries it, because policy names are
+                     unique per table, not per schema.
   --schema <name>    Schema to audit (default: public).
   --url URL          Supabase project URL — enables the DAST pass ($SUPABASE_URL).
   --anon-key VALUE   Public anon credential for the DAST pass. Env: SUPABASE_ANON_KEY.
@@ -74,6 +82,12 @@ function parseArgs(argv) {
       case '--json':
         opts.json = true
         break
+      case '--fail-on':
+        opts.failOn = argv[++i]
+        break
+      case '--strict':
+        opts.failOn = 'warn' // convenience alias
+        break
       case '--allow':
         opts.allow = splitList(argv[++i])
         break
@@ -93,7 +107,8 @@ function parseArgs(argv) {
         opts.dastWrite = true
         break
       default:
-        if (a.startsWith('--allow=')) opts.allow = splitList(a.slice('--allow='.length))
+        if (a.startsWith('--fail-on=')) opts.failOn = a.slice('--fail-on='.length)
+        else if (a.startsWith('--allow=')) opts.allow = splitList(a.slice('--allow='.length))
         else if (a.startsWith('--schema=')) opts.schema = a.slice('--schema='.length) || 'public'
         else if (a.startsWith('--url=')) opts.url = a.slice('--url='.length)
         else if (a.startsWith('--anon-key=')) opts.anonKey = a.slice('--anon-key='.length)
@@ -108,6 +123,10 @@ function parseArgs(argv) {
   opts.site = opts.site || process.env.SUPABASE_SITE_URL
   // Env var merges with --allow; CLI names are additive, not a replacement.
   opts.allow = [...splitList(process.env.RLS_AUDIT_ALLOW), ...opts.allow]
+  opts.failOn = (opts.failOn || process.env.RLS_AUDIT_FAIL_ON || 'fail').toLowerCase()
+  if (opts.failOn !== 'fail' && opts.failOn !== 'warn') {
+    throw new UsageError(`Invalid --fail-on "${opts.failOn}". Use "fail" (default) or "warn".`)
+  }
   return opts
 }
 
@@ -154,11 +173,18 @@ function report(result) {
     )
   }
 
-  if (result.passed) {
+  if (result.gatePassed) {
     const tail = warns.length ? ` ${DIM}(${warns.length} warning(s))${RESET}` : ''
     console.log(`\n${GREEN}RLS audit passed.${RESET}${tail}`)
+    // Eleven of the rules only ever emit `warn`. Saying nothing here lets a
+    // reader assume "passed" means "nothing worth acting on" — including for
+    // an `authenticated` tenant leak, which is a warn today.
+    if (warns.length) {
+      console.log(`${DIM}  ${warns.length} warning(s) did not fail the build. Use --fail-on warn to gate on them.${RESET}`)
+    }
   } else {
-    console.log(`\n${RED}RLS audit failed: ${result.problems} problem(s) found.${RESET}`)
+    const what = result.problems ? `${result.problems} problem(s) found` : `${warns.length} warning(s) with --fail-on warn`
+    console.log(`\n${RED}RLS audit failed: ${what}.${RESET}`)
   }
 }
 
@@ -232,6 +258,11 @@ async function main() {
     }
   }
 
+  // `passed` is the rule-level verdict (no fail-severity findings). `gatePassed`
+  // is the BUILD verdict, which --fail-on can widen to include warnings. Set it
+  // here, after every pass (static + DAST + site scan) has contributed findings.
+  result.gatePassed = opts.failOn === 'warn' ? result.problems === 0 && result.warnings === 0 : result.passed
+
   if (opts.json) {
     console.log(JSON.stringify(result, null, 2))
   } else {
@@ -239,7 +270,7 @@ async function main() {
     report(result)
   }
 
-  return result.passed ? 0 : 1
+  return result.gatePassed ? 0 : 1
 }
 
 main()

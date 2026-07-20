@@ -291,9 +291,21 @@ function topLevelOr(n) {
         return [...topLevelOr(n.left), ...topLevelOr(n.right)];
     return [n];
 }
+// Functions we understand precisely, so they never count as an opaque "scoping
+// helper" (which downgrades a finding to a warn on the grounds that a static
+// scan cannot see inside).
+//
+// `exists` belongs here: it is NOT opaque. Its subquery is right there in the
+// parse tree. Treating it as a helper meant `USING (EXISTS (SELECT 1 FROM
+// profiles))` — which is true for every row as soon as that table has a single
+// record, and scopes nothing at all — was reported as a soft warn instead of an
+// open read. A CORRELATED exists (`… WHERE user_id = auth.uid()`) still reads as
+// scoped, because containsRealScope descends into the subquery and finds the
+// caller comparison there.
 const BUILTINS = new Set([
     'auth.uid', 'auth.jwt', 'auth.role', 'current_setting', 'coalesce', 'any', 'all', 'array',
     'lower', 'upper', 'trim', 'length', 'char_length', 'cardinality', 'nullif', 'greatest', 'least',
+    'exists',
 ]);
 function helperCall(root) {
     let found = null;
@@ -315,12 +327,37 @@ function helperCall(root) {
     return found;
 }
 // ── Public API (same signatures as the old regex module) ────────────────────
+//
+// Every entry point below walks the parse tree recursively. `parseQual` already
+// catches parse errors, but the WALKERS were unguarded, so a pathologically deep
+// qualifier (`true OR true OR …` ×10 000 — a generated policy, or a hostile one)
+// blew the JS stack with an uncaught RangeError and killed the whole audit: one
+// bad policy took down every other table's result.
+//
+// `guarded` contains that blast radius. The fallback value is chosen so an
+// un-analyzable qualifier can never look SAFE:
+//   · isTautology        → false  (don't claim "always true" we didn't prove)
+//   · restrictsToCaller  → false  (so the policy reads as UNSCOPED → flagged)
+//   · isAlwaysFalse      → false  (an OR branch we can't prove false still widens)
+//   · helperCall         → null   (no soft "it's behind a helper" excuse)
+//   · hasUnprovenOrBranch→ true   (warn, never silent green)
+// Net effect: the policy is reported, not skipped.
+function guarded(fn, fallback) {
+    try {
+        return fn();
+    }
+    catch (err) {
+        if (err instanceof RangeError)
+            return fallback;
+        throw err;
+    }
+}
 /** Is this qualifier a tautology (always-true), so it scopes nothing? */
 export function isTautology(qual) {
     if (qual == null)
         return false;
     const node = parseQual(qual);
-    return node ? isAlwaysTrue(node) : false;
+    return node ? guarded(() => isAlwaysTrue(node), false) : false;
 }
 /**
  * Does this qualifier really SCOPE access to the caller? Fail-safe: it's scoped
@@ -362,23 +399,26 @@ export function restrictsToCallerQual(qual) {
     if (!node)
         return false;
     // A tautology neutralises any scope it also mentions.
-    if (isAlwaysTrue(node))
-        return false;
-    return containsRealScope(node);
+    return guarded(() => {
+        // A tautology neutralises any scope it also mentions.
+        if (isAlwaysTrue(node))
+            return false;
+        return containsRealScope(node);
+    }, false);
 }
 /** Is this term provably always FALSE (so it widens nothing in an OR)? */
 export function isAlwaysFalseQual(qual) {
     if (qual == null)
         return false;
     const node = parseQual(qual);
-    return node ? isAlwaysFalse(node) : false;
+    return node ? guarded(() => isAlwaysFalse(node), false) : false;
 }
 /** First user-defined (non-built-in) function call in the qualifier, or null. */
 export function helperCallQual(qual) {
     if (qual == null)
         return null;
     const node = parseQual(qual);
-    return node ? helperCall(node) : null;
+    return node ? guarded(() => helperCall(node), null) : null;
 }
 /**
  * FAIL-SAFE: does any top-level OR disjunct fail to prove it restricts the
@@ -392,8 +432,10 @@ export function hasUnprovenOrBranch(qual) {
     const node = parseQual(qual);
     if (!node)
         return true; // can't prove it — never silent-green
-    const disjuncts = topLevelOr(node);
-    if (disjuncts.length <= 1)
-        return false;
-    return !disjuncts.every((d) => restrictsToCaller(d) || isAlwaysFalse(d));
+    return guarded(() => {
+        const disjuncts = topLevelOr(node);
+        if (disjuncts.length <= 1)
+            return false;
+        return !disjuncts.every((d) => restrictsToCaller(d) || isAlwaysFalse(d));
+    }, true);
 }

@@ -118,12 +118,84 @@ export function extractScriptUrls(html, baseUrl) {
   return [...urls]
 }
 
+// Read at most this much of a response. A key is a short token near the top of a
+// bundle; a multi-gigabyte body has nothing more to tell us and would exhaust
+// the process heap.
+const MAX_BODY_BYTES = 5 * 1024 * 1024
+const FETCH_TIMEOUT_MS = 10_000
+
 async function bodyText(res) {
   try {
-    return await res.text()
+    const text = await res.text()
+    return text.length > MAX_BODY_BYTES ? text.slice(0, MAX_BODY_BYTES) : text
   } catch {
     return ''
   }
+}
+
+/**
+ * Is this URL safe to fetch from a server?
+ *
+ * The site scanner follows `<script src>` from a page it was pointed at, so the
+ * page decides what gets requested. Unbounded, that is a server-side request
+ * forgery primitive: a hostile page (or a compromised third-party script tag)
+ * can aim the scanner at cloud metadata or an internal service. In the CLI the
+ * blast radius is a developer's laptop; in the hosted Monitor — which the docs
+ * say shares this engine — it is the production network.
+ *
+ * Only public http(s) hosts are allowed. Literal private, loopback, link-local
+ * and CGNAT addresses are refused. This does NOT defeat DNS rebinding or a
+ * hostname that resolves to a private IP, which is declared in SECURITY.md
+ * rather than silently missed.
+ */
+/** Hostnames that only ever resolve to a cloud instance-metadata service. */
+const METADATA_HOSTS = new Set([
+  'metadata.google.internal', 'metadata.goog', 'metadata',
+  'instance-data', 'instance-data.ec2.internal',
+])
+
+export function isFetchableUrl(raw) {
+  let u
+  try {
+    u = new URL(raw)
+  } catch {
+    return false
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return false
+  const host = u.hostname.replace(/^\[|\]$/g, '').toLowerCase()
+  if (host === 'localhost' || host.endsWith('.localhost') || host === '::1' || host === '0.0.0.0') return false
+  // The v6 unspecified address is not "no address": connecting to :: reaches
+  // loopback on Linux, exactly like 0.0.0.0 does for v4. The URL parser folds
+  // ::0 and 0:0:0:0:0:0:0:0 into this same spelling.
+  if (host === '::') return false
+  // Cloud metadata endpoints answer on a name as well as on 169.254.169.254,
+  // and the name never resolves anywhere public.
+  if (METADATA_HOSTS.has(host) || host.endsWith('.metadata.google.internal')) return false
+  // IPv4-mapped IPv6 is the same address wearing a different hat — and the URL
+  // parser rewrites it to HEX (`::ffff:169.254.169.254` → `::ffff:a9fe:a9fe`),
+  // so matching only the dotted spelling would let the metadata endpoint through
+  // under its normalized name. Fold it back to dotted before the checks below.
+  const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(host)
+  const dotted = mapped
+    ? [parseInt(mapped[1], 16) >> 8, parseInt(mapped[1], 16) & 0xff, parseInt(mapped[2], 16) >> 8, parseInt(mapped[2], 16) & 0xff].join('.')
+    : host
+  const v4 = /^(?:::ffff:)?(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(dotted)
+  if (v4) {
+    const [a, b] = [Number(v4[1]), Number(v4[2])]
+    if (a === 10 || a === 127 || a === 0) return false
+    if (a === 172 && b >= 16 && b <= 31) return false
+    if (a === 192 && b === 168) return false
+    if (a === 169 && b === 254) return false // cloud metadata
+    if (a === 100 && b >= 64 && b <= 127) return false // CGNAT
+    return true
+  }
+  if (host.startsWith('fd') || host.startsWith('fc') || host.startsWith('fe80:')) return false // ULA / link-local
+  return true
+}
+
+/** fetch with a timeout, so an endpoint that never answers can't hang CI. */
+function fetchWithTimeout(fetchImpl, url, init = {}) {
+  return fetchImpl(url, { ...init, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) })
 }
 
 /**
@@ -138,17 +210,23 @@ export async function scanSiteForServiceRole({ siteUrl, fetchImpl = fetch, maxSc
   const findings = []
   let scanned = 0
 
-  const pageRes = await fetchImpl(siteUrl, { headers })
+  // The URL the CALLER gave us is checked too: pointing --site at a private
+  // address is a usage error, and refusing it keeps the CLI and the hosted
+  // Monitor on the same rule.
+  if (!isFetchableUrl(siteUrl)) {
+    throw new Error(`Refusing to scan ${siteUrl}: only public http(s) hosts are allowed (no loopback, private, link-local or metadata addresses).`)
+  }
+  const pageRes = await fetchWithTimeout(fetchImpl, siteUrl, { headers })
   const html = await bodyText(pageRes)
   scanned++
   const pageFinding = findingFor(scanText(html), siteUrl)
   if (pageFinding) findings.push(pageFinding)
 
-  const scripts = extractScriptUrls(html, siteUrl).slice(0, maxScripts)
+  const scripts = extractScriptUrls(html, siteUrl).filter(isFetchableUrl).slice(0, maxScripts)
   for (const url of scripts) {
     let body = ''
     try {
-      const r = await fetchImpl(url, { headers })
+      const r = await fetchWithTimeout(fetchImpl, url, { headers })
       body = await bodyText(r)
     } catch {
       continue // a script we can't fetch just isn't scanned

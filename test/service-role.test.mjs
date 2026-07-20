@@ -6,6 +6,7 @@ import {
   findingFor,
   extractScriptUrls,
   scanSiteForServiceRole,
+  isFetchableUrl,
 } from '../src/service-role.mjs'
 
 // Build a well-formed (unsigned) Supabase-style JWT for a given role.
@@ -93,4 +94,31 @@ test('scanSiteForServiceRole is quiet on a clean site (only the anon key)', asyn
   }
   const { findings } = await scanSiteForServiceRole({ siteUrl: 'https://safe.example.com/', fetchImpl })
   assert.deepEqual(findings, [])
+})
+
+// The site scanner follows `<script src>` from a page it was pointed at, so the
+// PAGE decides what gets requested — an SSRF primitive if left unbounded. On the
+// CLI the blast radius is a laptop; in the hosted Monitor, which the docs say
+// shares this engine, it is the production network.
+test('#ssrf the site scanner refuses private, loopback and metadata hosts', () => {
+  for (const url of [
+    'http://169.254.169.254/latest/meta-data/', 'http://[::ffff:169.254.169.254]/a.js',
+    'http://127.0.0.1:8080/x.js', 'http://[::ffff:127.0.0.1]/x', 'http://localhost/x.js',
+    'http://10.0.0.5/a.js', 'http://172.16.0.1/a.js', 'http://192.168.1.10/a.js',
+    'http://[::1]/a.js', 'http://100.64.0.1/a.js', 'http://[fd00::1]/x', 'http://[fe80::1]/x',
+    'file:///etc/passwd', 'http://0.0.0.0/x',
+    // The v6 unspecified address reaches loopback on Linux; the parser folds
+    // every spelling of it into "::".
+    'http://[::]/x.js', 'http://[::0]/x', 'http://[0:0:0:0:0:0:0:0]/x',
+    // Metadata services answer on a name, not only on 169.254.169.254.
+    'http://metadata.google.internal/computeMetadata/v1/',
+    'http://metadata.goog/x', 'http://instance-data/latest/',
+    'http://instance-data.ec2.internal/x',
+  ]) assert.equal(isFetchableUrl(url), false, `${url} must be refused`)
+
+  // …and the boundaries stay open: these are public addresses.
+  for (const url of [
+    'https://app.example.com/_next/static/chunk.js', 'http://cdn.jsdelivr.net/x.js',
+    'https://172.32.0.1/a.js', 'https://192.169.0.1/a.js', 'https://8.8.8.8/x', 'https://[2606:4700::1]/x',
+  ]) assert.equal(isFetchableUrl(url), true, `${url} must be allowed`)
 })

@@ -16,9 +16,13 @@ inputs:
     required: false
     default: ''
   schema:
-    description: 'Schema to audit.'
+    description: 'Schema to audit. A schema with nothing in it now FAILS the gate instead of passing green — an empty or misspelled schema is not proof that your RLS is correct.'
     required: false
     default: 'public'
+  fail-on:
+    description: 'What breaks the build: "fail" (default) or "warn". Most rules emit warn (including an authenticated tenant leak); with "fail" they are printed but cannot gate.'
+    required: false
+    default: 'fail'
   site:
     description: 'Deployed site URL to scan for an exposed service_role key (bypasses all RLS). Optional; needs no database.'
     required: false
@@ -53,13 +57,22 @@ runs:
       working-directory: ${{ github.action_path }}
       run: npm ci --omit=dev --no-audit --no-fund
 
+    # Every input goes through env. `${{ }}` is substituted textually BEFORE bash
+    # parses the line, so quotes do NOT protect an input interpolated inline in
+    # `run:` — a caller wiring `schema:` to issue-body or matrix data would get
+    # command execution on their runner, which holds SUPABASE_DB_URL.
+    # DAST_WRITE_FLAG is a literal picked by the ternary (never caller text), so
+    # leaving it unquoted is safe and lets the empty case expand to no argument.
     - name: Run RLS audit (the gate)
       shell: bash
       run: >
-        node "${{ github.action_path }}/bin/airlock.mjs"
-        --schema "${{ inputs.schema }}"
-        ${{ inputs.dast-write == 'true' && '--dast-write' || '' }}
+        node "$GITHUB_ACTION_PATH/bin/airlock.mjs"
+        --schema "$INPUT_SCHEMA"
+        $DAST_WRITE_FLAG
       env:
+        INPUT_SCHEMA: ${{ inputs.schema }}
+        RLS_AUDIT_FAIL_ON: ${{ inputs.fail-on }}
+        DAST_WRITE_FLAG: ${{ inputs.dast-write == 'true' && '--dast-write' || '' }}
         SUPABASE_DB_URL: ${{ inputs.db-url }}
         RLS_AUDIT_ALLOW: ${{ inputs.allow }}
         SUPABASE_SITE_URL: ${{ inputs.site }}

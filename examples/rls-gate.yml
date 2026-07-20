@@ -22,9 +22,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Airlock — RLS CI Gate
+        # @v1 is a moving tag: whoever controls it can change what runs in your
+        # CI, which already holds your database URL. Pin the commit SHA and let
+        # Dependabot bump it. Swap this for the SHA of the release you audited.
         uses: mateuszingano/airlock-rls@v1
         with:
           db-url: ${{ secrets.SUPABASE_DB_URL }}
-          # Optional — policies that are permissive on purpose:
-          # allow: public_read,status_select
+          # Optional — policies that are permissive on purpose. Prefer the
+          # qualified "table.policy" form; a bare name is only applied when
+          # exactly one table carries it.
+          # allow: status_page.public_read,orders.status_select
           # schema: public
+          # Several rules only warn. This makes them break the build:
+          # fail-on: warn
