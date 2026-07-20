@@ -54,6 +54,9 @@ Options:
   --anon-key VALUE   Public anon credential for the DAST pass. Env: SUPABASE_ANON_KEY.
   --site URL         Deployed site URL — scans its HTML/JS for an exposed
                      service_role key. Needs no database. Env: SUPABASE_SITE_URL.
+  --max-scripts <n>  How many JS bundles the --site scan reads (default: 50).
+                     If a site has more, a scan_truncated warning names how many
+                     went unscanned rather than implying it looked at them all.
   --dast-write       Also probe anonymous INSERTs (safe: an empty payload fails a
                      column constraint, revealing RLS passed without persisting).
   --json             Print the result as JSON instead of a report.
@@ -103,6 +106,9 @@ function parseArgs(argv) {
       case '--site':
         opts.site = argv[++i]
         break
+      case '--max-scripts':
+        opts.maxScripts = parseMaxScripts(argv[++i])
+        break
       case '--dast-write':
         opts.dastWrite = true
         break
@@ -113,6 +119,7 @@ function parseArgs(argv) {
         else if (a.startsWith('--url=')) opts.url = a.slice('--url='.length)
         else if (a.startsWith('--anon-key=')) opts.anonKey = a.slice('--anon-key='.length)
         else if (a.startsWith('--site=')) opts.site = a.slice('--site='.length)
+        else if (a.startsWith('--max-scripts=')) opts.maxScripts = parseMaxScripts(a.slice('--max-scripts='.length))
         else if (a.startsWith('-')) throw new UsageError(`Unknown option: ${a}`)
         else positional.push(a)
     }
@@ -135,6 +142,14 @@ function splitList(v) {
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean)
+}
+
+function parseMaxScripts(v) {
+  const n = Number(v)
+  if (!Number.isInteger(n) || n < 1) {
+    throw new UsageError(`Invalid --max-scripts "${v}". Use a positive integer.`)
+  }
+  return n
 }
 
 class UsageError extends Error {}
@@ -247,7 +262,7 @@ async function main() {
   // Site scan: a service_role key shipped to the browser bypasses ALL RLS —
   // the worst leak there is. Needs only the deployed site URL (no DB).
   if (opts.site) {
-    const { findings, scanned } = await scanSiteForServiceRole({ siteUrl: opts.site })
+    const { findings, scanned } = await scanSiteForServiceRole({ siteUrl: opts.site, ...(opts.maxScripts != null ? { maxScripts: opts.maxScripts } : {}) })
     result.siteScan = { scanned, url: opts.site }
     if (findings.length) {
       result.findings.push(...findings)

@@ -388,8 +388,9 @@ export function helperScope(qual) {
     return helperCall(node);
 }
 // ── Primitives, qualifier-string in ─────────────────────────────────────────
-// Shared with the free CLI so both products decide "tautology / real scope /
-// helper" from the SAME parse tree, while each keeps its own finding taxonomy.
+// This IS the free CLI's parser. The hosted Monitor decides "tautology / real
+// scope / helper" the same way, but from its OWN vendored copy of this file —
+// a fix here does NOT reach it. Keep the two in sync by hand.
 /** Does this term really restrict to the caller (auth.uid() = <col>, or the
  *  backend service_role)? Merely mentioning the token does not count. */
 export function restrictsToCallerQual(qual) {

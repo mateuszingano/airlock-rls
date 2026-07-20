@@ -23,6 +23,14 @@ import { audit } from '../src/audit.mjs'
 const DB_URL = process.env.AIRLOCK_TEST_DB_URL || process.env.DATABASE_URL
 const gate = { skip: DB_URL ? false : 'no AIRLOCK_TEST_DB_URL / DATABASE_URL — skipping integration test' }
 
+/** Swap the userinfo of a Postgres URL, keeping host/port/db/params intact. */
+function withUser(url, user, password) {
+  const u = new URL(url)
+  u.username = user
+  u.password = password
+  return u.href
+}
+
 async function loadFixture(name) {
   const sql = await readFile(fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url)), 'utf8')
   const { default: pg } = await import('pg')
@@ -73,4 +81,31 @@ test('clean schema: audit() passes (no fail-severity findings)', gate, async () 
 
   assert.equal(result.passed, true, `clean schema must pass, fails: ${JSON.stringify(result.findings.filter((f) => f.severity === 'fail'))}`)
   assert.equal(result.problems, 0)
+})
+
+// C1 (re-auditoria 20/07) — the whole gate went GREEN when the audit ran as a
+// least-privilege role that is NOT a member of anon/authenticated, because
+// information_schema.role_table_grants only returns rows the caller can "see".
+// The README tells users to use exactly such a role. has_table_privilege()
+// answers from the catalog regardless of the caller, so the leak must still be
+// caught. This runs as `airlock_restricted`, created by restricted-role.sql.
+test('C1: a leak is still caught when the audit runs as a restricted role', gate, async () => {
+  await loadFixture('restricted-role.sql')
+
+  // Re-point the connection at the restricted login, keeping host/port/db.
+  const restrictedUrl = withUser(DB_URL, 'airlock_restricted', 'restricted')
+  const result = await audit({ dbUrl: restrictedUrl, schema: 'app' })
+
+  // The notes leak (permissive USING(true) readable by anon) is grant-dependent:
+  // it is exactly what the old query hid. It MUST still be a fail here.
+  const notesLeak = result.findings.filter(
+    (f) => f.severity === 'fail' && f.kind === 'permissive_true' && f.object.startsWith('notes.')
+  )
+  assert.ok(
+    notesLeak.length > 0,
+    `the anon-readable notes leak must be caught even as a restricted role, got: ${JSON.stringify(
+      result.findings.map((f) => ({ k: f.kind, o: f.object, s: f.severity }))
+    )}`
+  )
+  assert.equal(result.passed, false, 'a restricted-role audit of a leaky schema must not pass')
 })

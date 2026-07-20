@@ -44,4 +44,23 @@ jobs:
           node-version: '20'
       - run: npm install --no-audit --no-fund
       # Only the integration file; it connects to the service container above.
-      - run: node --test test/integration.test.mjs
+      # A SKIP is not a PASS: if the DB never came up (or the env was dropped),
+      # the file's gate makes every test skip and `node --test` still exits 0 —
+      # the job would go green having verified nothing, which is exactly the
+      # false-confidence this job exists to prevent. So fail on any skip, and
+      # fail if zero tests ran. pipefail preserves a real test failure too.
+      - name: Integration tests (must actually run, never skip)
+        shell: bash
+        run: |
+          set -eo pipefail
+          # --test-reporter=tap pins the summary format (`# pass N` / `# skipped N`)
+          # so the checks below don't depend on the default reporter.
+          node --test --test-reporter=tap test/integration.test.mjs 2>&1 | tee integration-out.txt
+          if grep -qE '^# skipped [1-9]' integration-out.txt; then
+            echo "::error::Integration tests SKIPPED — the Postgres service was unreachable. A green skip is not a pass."
+            exit 1
+          fi
+          if ! grep -qE '^# pass [1-9]' integration-out.txt; then
+            echo "::error::No integration tests ran."
+            exit 1
+          fi

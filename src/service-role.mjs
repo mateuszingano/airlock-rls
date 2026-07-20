@@ -140,8 +140,8 @@ async function bodyText(res) {
  * page decides what gets requested. Unbounded, that is a server-side request
  * forgery primitive: a hostile page (or a compromised third-party script tag)
  * can aim the scanner at cloud metadata or an internal service. In the CLI the
- * blast radius is a developer's laptop; in the hosted Monitor — which the docs
- * say shares this engine — it is the production network.
+ * blast radius is a developer's laptop; in the hosted Monitor (which vendors its
+ * own copy of this scanner) it is the production network.
  *
  * Only public http(s) hosts are allowed. Literal private, loopback, link-local
  * and CGNAT addresses are refused. This does NOT defeat DNS rebinding or a
@@ -193,9 +193,50 @@ export function isFetchableUrl(raw) {
   return true
 }
 
-/** fetch with a timeout, so an endpoint that never answers can't hang CI. */
-function fetchWithTimeout(fetchImpl, url, init = {}) {
-  return fetchImpl(url, { ...init, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) })
+// Cap on redirects we'll follow before giving up — matches the browser default
+// and stops a redirect loop from hanging the scan.
+const MAX_REDIRECTS = 5
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
+
+/**
+ * fetch with a timeout, so an endpoint that never answers can't hang CI, AND
+ * with SAFE redirect handling.
+ *
+ * The default `redirect: 'follow'` was an SSRF hole: `isFetchableUrl` vets the
+ * URL we were pointed at, but a public host answering `302 → 169.254.169.254`
+ * (or a compromised CDN in a `<script src>`) sends the fetch onward to an
+ * internal address that was never checked. So we drive redirects by hand with
+ * `redirect: 'manual'` and re-run `isFetchableUrl` on every hop's Location.
+ * A hop to a refused address throws — it is not silently followed, and not
+ * silently skipped either.
+ */
+async function fetchWithTimeout(fetchImpl, url, init = {}) {
+  let current = url
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    const res = await fetchImpl(current, {
+      ...init,
+      redirect: 'manual',
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    })
+    const status = res?.status
+    if (!REDIRECT_STATUSES.has(status)) return res
+    const location = res?.headers?.get?.('location')
+    if (!location) return res // a 3xx with no Location — nothing to follow
+    let next
+    try {
+      next = new URL(location, current).href
+    } catch {
+      throw new Error(`Refusing to follow malformed redirect from ${current} to "${location}".`)
+    }
+    if (!isFetchableUrl(next)) {
+      throw new Error(
+        `Refusing to follow redirect from ${current} to ${next}: only public http(s) hosts are allowed ` +
+          `(no loopback, private, link-local or metadata addresses). This is the SSRF guard.`
+      )
+    }
+    current = next
+  }
+  throw new Error(`Too many redirects (> ${MAX_REDIRECTS}) starting from ${url}.`)
 }
 
 /**
@@ -222,7 +263,23 @@ export async function scanSiteForServiceRole({ siteUrl, fetchImpl = fetch, maxSc
   const pageFinding = findingFor(scanText(html), siteUrl)
   if (pageFinding) findings.push(pageFinding)
 
-  const scripts = extractScriptUrls(html, siteUrl).filter(isFetchableUrl).slice(0, maxScripts)
+  const fetchable = extractScriptUrls(html, siteUrl).filter(isFetchableUrl)
+  const scripts = fetchable.slice(0, maxScripts)
+  // Looking at the first N bundles and reporting "clean" is indistinguishable
+  // from having looked at all of them — and a service key often lives in a
+  // route chunk, not the entry bundle. Say out loud when we stopped short, so a
+  // clean report keeps meaning "I looked", not "I looked at some".
+  if (fetchable.length > maxScripts) {
+    findings.push({
+      kind: 'scan_truncated',
+      severity: 'warn',
+      object: siteUrl,
+      detail:
+        `Only the first ${maxScripts} of ${fetchable.length} script bundles were scanned — ` +
+        `${fetchable.length - maxScripts} were NOT checked for an exposed service key. ` +
+        `Raise the cap with --max-scripts to scan them all.`,
+    })
+  }
   for (const url of scripts) {
     let body = ''
     try {

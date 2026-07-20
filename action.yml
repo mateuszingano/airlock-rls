@@ -12,7 +12,7 @@ inputs:
     description: 'Postgres connection string for the Supabase project to audit. Store it as a repo secret and pass it here.'
     required: true
   allow:
-    description: 'Comma-separated policy names that are intentionally permissive (e.g. a public status page). These will not fail the gate.'
+    description: 'Comma-separated waivers for things that are open on purpose (e.g. a public status page). Policy names may be bare or "table.policy"; buckets, views, matviews, functions and realtime tables must carry their namespace — "storage:receipts", "view:summary", "matview:reports", "fn:is_admin", "realtime:orders". These will not fail the gate.'
     required: false
     default: ''
   schema:

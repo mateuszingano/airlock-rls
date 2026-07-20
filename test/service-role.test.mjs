@@ -122,3 +122,74 @@ test('#ssrf the site scanner refuses private, loopback and metadata hosts', () =
     'https://172.32.0.1/a.js', 'https://192.169.0.1/a.js', 'https://8.8.8.8/x', 'https://[2606:4700::1]/x',
   ]) assert.equal(isFetchableUrl(url), true, `${url} must be allowed`)
 })
+
+// H1 (re-auditoria 20/07) — SSRF por REDIRECT. isFetchableUrl vetava a URL de
+// entrada, mas o fetch seguia um 302 pra um endereço interno que nunca foi
+// checado. Agora cada hop revalida o Location. Este teste também MATA a mutação
+// que remove o .filter/revalidação — o filtro puro nunca era exercido pela fiação.
+test('#ssrf a redirect to a private/metadata address is refused, not followed', async () => {
+  let reachedInternal = false
+  const fetchImpl = async (url, init) => {
+    // sanity: precisamos estar dirigindo o redirect à mão
+    assert.equal(init.redirect, 'manual', 'fetch must be driven with redirect:manual')
+    if (url === 'https://public.example.com/') {
+      return { status: 302, headers: { get: (h) => (h.toLowerCase() === 'location' ? 'http://169.254.169.254/latest/meta-data/' : null) }, text: async () => '' }
+    }
+    if (url.includes('169.254')) {
+      reachedInternal = true
+      return { status: 200, headers: { get: () => null }, text: async () => `admin="${SERVICE_JWT}"` }
+    }
+    return { status: 200, headers: { get: () => null }, text: async () => '' }
+  }
+  await assert.rejects(
+    () => scanSiteForServiceRole({ siteUrl: 'https://public.example.com/', fetchImpl }),
+    /only public|SSRF|Refusing to follow redirect/,
+    'a redirect to the metadata IP must be refused'
+  )
+  assert.equal(reachedInternal, false, 'the internal address must never be fetched')
+})
+
+// H1b — a legitimate public→public redirect IS followed and scanned.
+test('#ssrf a redirect between public hosts is followed and scanned', async () => {
+  const fetchImpl = async (url) => {
+    if (url === 'https://site.example.com/') {
+      return { status: 301, headers: { get: (h) => (h.toLowerCase() === 'location' ? 'https://cdn.example.net/app.js' : null) }, text: async () => '' }
+    }
+    if (url === 'https://cdn.example.net/app.js') {
+      return { status: 200, headers: { get: () => null }, text: async () => `const admin="${SERVICE_JWT}"` }
+    }
+    return { status: 200, headers: { get: () => null }, text: async () => '' }
+  }
+  const { findings } = await scanSiteForServiceRole({ siteUrl: 'https://site.example.com/', fetchImpl })
+  assert.equal(findings.length, 1, 'the key on the redirected-to public host is found')
+  assert.equal(findings[0].severity, 'fail')
+})
+
+// H2 (re-auditoria 20/07) — o scan lia no máximo 50 bundles e reportava limpo,
+// indistinguível de "olhei tudo". Agora emite scan_truncated nomeando quantos
+// ficaram de fora, e --max-scripts ajusta o teto.
+test('#truncation scanning more scripts than the cap emits scan_truncated', async () => {
+  const many = Array.from({ length: 80 }, (_, i) => `<script src="/a${i}.js"></script>`).join('')
+  const fetchImpl = async (url) => ({
+    status: 200, headers: { get: () => null },
+    text: async () => (url === 'https://big.example.com/' ? `<html>${many}</html>` : ''),
+  })
+  const { findings, scanned } = await scanSiteForServiceRole({ siteUrl: 'https://big.example.com/', fetchImpl })
+  const trunc = findings.find((f) => f.kind === 'scan_truncated')
+  assert.ok(trunc, 'a scan_truncated finding must be emitted when scripts exceed the cap')
+  assert.equal(trunc.severity, 'warn')
+  assert.match(trunc.detail, /50 of 80/, 'it names how many were scanned vs total')
+  assert.equal(scanned, 51, 'page + 50 bundles')
+
+  // under the cap → no truncation finding, and --max-scripts raises the ceiling
+  const few = Array.from({ length: 10 }, (_, i) => `<script src="/b${i}.js"></script>`).join('')
+  const fetchImpl2 = async (url) => ({
+    status: 200, headers: { get: () => null },
+    text: async () => (url === 'https://small.example.com/' ? `<html>${few}</html>` : ''),
+  })
+  const r2 = await scanSiteForServiceRole({ siteUrl: 'https://small.example.com/', fetchImpl: fetchImpl2 })
+  assert.ok(!r2.findings.some((f) => f.kind === 'scan_truncated'), '10 scripts under a 50 cap → no truncation')
+
+  const r3 = await scanSiteForServiceRole({ siteUrl: 'https://big.example.com/', fetchImpl, maxScripts: 100 })
+  assert.ok(!r3.findings.some((f) => f.kind === 'scan_truncated'), 'raising --max-scripts past the count clears the warning')
+})

@@ -990,3 +990,328 @@ test('#update FOR UPDATE with an unscoped USING is a fail, with or without WITH 
   const ok = upd({ roles: ['authenticated'], qual: 'owner_id = auth.uid()', with_check: 'owner_id = auth.uid()' })
   assert.equal(ok.problems, 0, 'a scoped USING is fine')
 })
+
+// ---------------------------------------------------------------------------
+// Re-audit 20/07 — the three findings that held airlock-rls at 0,0.
+// Every fixture below writes `roles` in the WIRE form Postgres actually hands
+// back (`'{anon}'`, a string), not the JS array that is convenient to type. A
+// Critical once survived 101 green tests precisely because every fixture used
+// the convenient spelling.
+// ---------------------------------------------------------------------------
+
+// #1 — A RESTRICTIVE policy narrows ONE side. `restrictiveScopes` read
+// `isScoped(r.qual)` for every case, so a restrictive that scoped reads was
+// taken as scoping WRITES too: `USING (owner = auth.uid()) WITH CHECK (true)`
+// downgraded a forge-as-another-tenant INSERT from fail to warn. USING does not
+// constrain a new row; only WITH CHECK does.
+test('#restrictive a scoped USING does not rescue an open WITH CHECK', () => {
+  const R = (restrictive) =>
+    buildResult({
+      schema: 'public',
+      allTables: [{ tablename: 'invoices' }],
+      policies: [
+        policy({ tablename: 'invoices', policyname: 'ins', cmd: 'INSERT', roles: '{anon}', qual: null, with_check: 'true' }),
+        { tablename: 'invoices', policyname: 'r', permissive: 'RESTRICTIVE', roles: '{anon}', ...restrictive },
+      ],
+    })
+
+  // The restrictive scopes reads only — the INSERT is still wide open.
+  const openCheck = R({ cmd: 'ALL', qual: 'owner = auth.uid()', with_check: 'true' })
+  assert.equal(openCheck.problems, 1, 'a restrictive WITH CHECK(true) narrows nothing on INSERT')
+  assert.ok(
+    !openCheck.findings.some((f) => /restrictive-narrowed/.test(f.detail)),
+    'must not claim the finding was narrowed'
+  )
+
+  // A restrictive that really does scope the new row downgrades it, as designed.
+  const realCheck = R({ cmd: 'ALL', qual: 'owner = auth.uid()', with_check: 'owner = auth.uid()' })
+  assert.equal(realCheck.problems, 0, 'a scoped restrictive WITH CHECK legitimately narrows the write')
+
+  // WITH CHECK omitted on the restrictive → Postgres falls back to USING.
+  const fallback = R({ cmd: 'ALL', qual: 'owner = auth.uid()', with_check: null })
+  assert.equal(fallback.problems, 0, 'omitted WITH CHECK falls back to the scoped USING')
+})
+
+// #1b — A restrictive on ONE command was taken as narrowing all four, because
+// the permissive side matched on `cmd === 'ALL'`. A restrictive FOR SELECT does
+// not stop anon from emptying the table.
+test('#restrictive a restrictive FOR SELECT does not narrow a permissive FOR ALL', () => {
+  const res = buildResult({
+    schema: 'public',
+    allTables: [{ tablename: 'notes' }],
+    policies: [
+      policy({ tablename: 'notes', policyname: 'open', cmd: 'ALL', roles: '{anon}', qual: 'true', with_check: null }),
+      { tablename: 'notes', policyname: 'r', permissive: 'RESTRICTIVE', cmd: 'SELECT', roles: '{anon}', qual: 'owner = auth.uid()', with_check: null },
+    ],
+  })
+  assert.ok(res.problems > 0, 'a SELECT-only restrictive cannot rescue DELETE/UPDATE exposure')
+})
+
+// #2 — The dedupe matched on the finding TEXT (`detail.startsWith('[ALL]')`),
+// so on a FOR ALL policy the read finding emitted first swallowed the tenant
+// takeover. Writing the CORRECT WITH CHECK made the gate quieter, which is the
+// exact inversion this section exists to kill.
+test('#dedupe a read finding does not swallow the UPDATE takeover on FOR ALL', () => {
+  const res = buildResult({
+    schema: 'public',
+    allTables: [{ tablename: 'notes' }],
+    policies: [
+      policy({ tablename: 'notes', cmd: 'ALL', roles: '{anon}', qual: 'true', with_check: 'owner_id = auth.uid()' }),
+    ],
+  })
+  assert.ok(
+    res.findings.some((f) => f.kind === 'update_using_unscoped'),
+    'the row-takeover finding must survive alongside the read finding'
+  )
+  // …and the vacuous shapes still do not double-report.
+  const vacuous = buildResult({
+    schema: 'public',
+    allTables: [{ tablename: 'notes' }],
+    policies: [policy({ tablename: 'notes', cmd: 'UPDATE', roles: '{anon}', qual: 'true', with_check: 'true' })],
+  })
+  assert.equal(vacuous.findings.length, 1, 'USING(true) + WITH CHECK(true) stays one finding')
+})
+
+// #3 — The allow-list was one flat namespace shared by six kinds of object, so
+// `--allow reports` silenced a policy, a bucket, a view, a function AND a
+// matview_exposed FAIL at once. Everything that is not a policy must now be
+// qualified.
+test('#allow a bare name no longer silences a bucket, view or matview', () => {
+  const base = {
+    schema: 'public',
+    allTables: [{ tablename: 'reports' }],
+    publicBuckets: [{ id: 'reports', name: 'reports' }],
+    views: [{ viewname: 'reports', security_invoker: 'false' }],
+    matviews: [{ matviewname: 'reports', anon_select: true }],
+  }
+
+  const bare = buildResult({ ...base, allow: ['reports'] })
+  assert.equal(bare.problems, 1, 'the matview FAIL must not be waived by a bare name')
+  assert.ok(kinds(bare).includes('matview_exposed'), 'matview finding survives')
+  assert.ok(kinds(bare).includes('allow_needs_namespace'), 'the author is told the entry did not apply')
+
+  const qualified = buildResult({ ...base, allow: ['matview:reports', 'storage:reports', 'view:reports'] })
+  assert.equal(qualified.problems, 0, 'the qualified form waives exactly what it names')
+  assert.equal(qualified.allowed.length, 3, 'all three are waived, none silently')
+})
+
+// #3b — A waiver that applies to nothing reads like protection and is none.
+test('#allow a stale entry is reported instead of accepted in silence', () => {
+  const res = buildResult({
+    schema: 'public',
+    allTables: [{ tablename: 'notes' }],
+    policies: [policy({ tablename: 'notes', roles: '{anon}', qual: 'true' })],
+    allow: ['renamed_last_year'],
+  })
+  assert.ok(kinds(res).includes('allow_unused'), 'a dead allow entry must surface')
+  // A live entry stays quiet.
+  const live = buildResult({
+    schema: 'public',
+    allTables: [{ tablename: 'notes' }],
+    policies: [policy({ tablename: 'notes', policyname: 'p', roles: '{anon}', qual: 'true' })],
+    allow: ['p'],
+  })
+  assert.ok(!kinds(live).includes('allow_unused'), 'an applied entry is not reported')
+})
+
+// R1 (regression the 20/07 fix ITSELF opened, caught by the verifier) — in the
+// vacuous-WITH-CHECK branch, `saved` speaks only for the CHECK side. A
+// restrictive that scopes the new row while leaving USING wide open downgraded
+// that finding to a warn AND suppressed the targeting finding, so the gate went
+// green on a proven row takeover: every row is reachable (both USINGs true) and
+// every rewrite passes the check by setting owner to self.
+test('#restrictive a check-side rescue must not hide the USING-side takeover', () => {
+  const res = buildResult({
+    schema: 'public',
+    allTables: [{ tablename: 'notes' }],
+    policies: [
+      policy({ tablename: 'notes', policyname: 'open', cmd: 'UPDATE', roles: '{authenticated}', qual: 'true', with_check: 'true' }),
+      { tablename: 'notes', policyname: 'r', permissive: 'RESTRICTIVE', cmd: 'UPDATE', roles: '{authenticated}', qual: 'true', with_check: 'owner = auth.uid()' },
+    ],
+  })
+  assert.ok(res.problems > 0, 'a restrictive that only scopes the new row does not close the takeover')
+  assert.ok(
+    res.findings.some((f) => f.kind === 'update_using_unscoped' && f.severity === 'fail'),
+    'the targeting finding must be emitted when USING was never narrowed'
+  )
+})
+
+// M6 (mutation check found the control had no test behind it) — `restrictiveScopes`
+// must parse the wire form of `roles`. Without normRoles, `'{public_reader}'`
+// matched 'public' by substring and a custom role masqueraded as the PUBLIC
+// pseudo-role, silently rescuing findings. This is the exact class of the
+// historical incident where normRoles turned every policy rule into a no-op.
+test('#restrictive a custom role containing "public" is not the PUBLIC pseudo-role', () => {
+  const res = buildResult({
+    schema: 'public',
+    allTables: [{ tablename: 'notes' }],
+    policies: [
+      policy({ tablename: 'notes', policyname: 'open', cmd: 'ALL', roles: '{anon}', qual: 'true', with_check: null }),
+      { tablename: 'notes', policyname: 'r', permissive: 'RESTRICTIVE', cmd: 'ALL', roles: '{public_reader}', qual: 'owner = auth.uid()', with_check: 'owner = auth.uid()' },
+    ],
+  })
+  assert.ok(res.problems > 0, 'a restrictive granted to public_reader does not narrow anon')
+  assert.ok(
+    !res.findings.some((f) => /restrictive-narrowed/.test(f.detail)),
+    'must not claim a narrowing that does not apply to this role'
+  )
+})
+
+// B3 (regression the same fix opened, caught by the honesty pass) — an --allow
+// entry naming a policy that EXISTS and is CLEAN was reported as stale
+// ("renamed, dropped, or never existed"). It produced no finding precisely
+// because the policy is correct; the waiver is doing its job quietly.
+test('#allow a waiver on a clean, existing policy is not called stale', () => {
+  const res = buildResult({
+    schema: 'public',
+    allTables: [{ tablename: 'notes' }],
+    policies: [policy({ tablename: 'notes', policyname: 'meu_waiver', roles: '{anon}', qual: 'owner = auth.uid()' })],
+    allow: ['meu_waiver'],
+  })
+  assert.ok(!kinds(res).includes('allow_unused'), 'a clean policy must not be reported as a dead waiver')
+
+  // The same must hold for a namespaced object that exists and is clean.
+  const clean = buildResult({
+    schema: 'public',
+    allTables: [{ tablename: 'notes' }],
+    views: [{ viewname: 'summary', security_invoker: 'true' }],
+    allow: ['view:summary'],
+  })
+  assert.ok(!kinds(clean).includes('allow_unused'), 'a clean view must not be reported as a dead waiver')
+
+  // …but a name that matches nothing at all still surfaces.
+  const dead = buildResult({
+    schema: 'public',
+    allTables: [{ tablename: 'notes' }],
+    policies: [policy({ tablename: 'notes', policyname: 'p', roles: '{anon}', qual: 'true' })],
+    allow: ['renamed_last_year'],
+  })
+  assert.ok(kinds(dead).includes('allow_unused'), 'a genuinely dead entry still surfaces')
+})
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Re-auditoria 20/07 (tarde) — os 3 Criticals pré-existentes + A8.1.
+// Fixtures na grafia WIRE do Postgres (`'{anon}'`, string), e grants passados
+// na forma que audit() produz: {table_name, grantee, privilege_type}.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// C2 — `FOR ALL` só olhava o GRANT de INSERT. Uma role com UPDATE mas sem
+// INSERT numa policy FOR ALL USING(true) não gerava finding, enquanto anon
+// reescrevia a tabela toda (provado em Postgres).
+test('#forall a FOR ALL policy with only an UPDATE grant is caught', () => {
+  const grant = (priv) => ({ table_name: 'notes', grantee: 'anon', privilege_type: priv })
+  const R = (grants) => buildResult({
+    schema: 'public', allTables: [{ tablename: 'notes' }],
+    policies: [policy({ tablename: 'notes', cmd: 'ALL', roles: '{anon}', qual: 'true', with_check: 'owner = current_user' })],
+    grants,
+  })
+  // só UPDATE (sem INSERT) — antes do conserto isto era 0 problems
+  const updOnly = R([grant('UPDATE')])
+  assert.ok(updOnly.problems > 0, 'FOR ALL + GRANT UPDATE (no INSERT) must be caught')
+  assert.ok(
+    updOnly.findings.some((f) => f.kind === 'update_using_unscoped' && f.severity === 'fail'),
+    'the row-takeover finding must fire on the UPDATE slice'
+  )
+  // e ainda pega quando é só INSERT (não regredir a cobertura do INSERT)
+  const insOnly = R([grant('INSERT')])
+  assert.ok(insOnly.problems > 0, 'FOR ALL + GRANT INSERT stays caught')
+  // sem NENHUM grant de escrita → nada do lado de escrita (fail-closed correto)
+  const noWrite = R([grant('SELECT')])
+  assert.ok(
+    !noWrite.findings.some((f) => f.kind === 'update_using_unscoped'),
+    'no write grant → no write/takeover finding'
+  )
+})
+
+// A8.1 — falso-positivo: um schema legítimo (permissiva FOR ALL + uma
+// restrictive escopada por comando) reprovava com 3 fails. Cada finding de um
+// FOR ALL é sobre UM comando concreto, e a restrictive daquele comando o
+// narrows. Antes, a checagem perguntava "cobre ALL?" e nenhuma per-command
+// restrictive respondia sim.
+test('#forall a full per-command restrictive set narrows a FOR ALL permissive', () => {
+  const g = (priv) => ({ table_name: 't', grantee: 'anon', privilege_type: priv })
+  const R = (cmd, extra) => ({ tablename: 't', policyname: 'r_' + cmd, permissive: 'RESTRICTIVE', cmd, roles: '{anon}', ...extra })
+  const scoped = 'owner = auth.uid()'
+  const res = buildResult({
+    schema: 'public', allTables: [{ tablename: 't' }],
+    policies: [
+      policy({ tablename: 't', policyname: 'open', cmd: 'ALL', roles: '{anon}', qual: 'true', with_check: 'true' }),
+      R('SELECT', { qual: scoped, with_check: null }),
+      R('INSERT', { qual: null, with_check: scoped }),
+      R('UPDATE', { qual: scoped, with_check: scoped }),
+      R('DELETE', { qual: scoped, with_check: null }),
+    ],
+    grants: ['SELECT', 'INSERT', 'UPDATE', 'DELETE'].map(g),
+  })
+  assert.equal(res.problems, 0, 'a legitimate, fully-restricted schema must not fail the gate')
+
+  // GUARDA (não reabrir o bug original): uma restrictive de UM comando NÃO
+  // pode rebaixar os outros comandos de um FOR ALL.
+  const partial = buildResult({
+    schema: 'public', allTables: [{ tablename: 't' }],
+    policies: [
+      policy({ tablename: 't', policyname: 'open', cmd: 'ALL', roles: '{anon}', qual: 'true', with_check: null }),
+      R('SELECT', { qual: scoped, with_check: null }),
+    ],
+    grants: ['SELECT', 'INSERT', 'UPDATE', 'DELETE'].map(g),
+  })
+  assert.ok(partial.problems > 0, 'a SELECT-only restrictive must not rescue DELETE/UPDATE of a FOR ALL')
+})
+
+// C3 — role custom alcançada por herança. `TO app_role` onde
+// `GRANT app_role TO authenticated` vaza pra todo usuário logado, mas casava
+// nem 'anon' nem 'authenticated' literalmente. `clientRoles` (de pg_has_role)
+// resolve. Sem clientRoles, o comportamento literal antigo é preservado.
+test('#roles an inherited custom role is treated as client-reachable', () => {
+  const base = {
+    schema: 'public', allTables: [{ tablename: 'docs' }],
+    policies: [policy({ tablename: 'docs', cmd: 'SELECT', roles: '{app_role}', qual: 'true', with_check: null })],
+    grants: [{ table_name: 'docs', grantee: 'authenticated', privilege_type: 'SELECT' }],
+  }
+  // com o grafo de membership: authenticated alcança app_role → pega
+  const withGraph = buildResult({
+    ...base,
+    clientRoles: { anon: new Set(['anon']), authenticated: new Set(['authenticated', 'app_role']) },
+  })
+  assert.ok(withGraph.problems > 0, 'a policy on a role inherited by authenticated must be caught')
+
+  // sem o grafo (chamador sem DB, ex.: teste unitário puro): comportamento
+  // literal antigo, sem crash
+  const withoutGraph = buildResult(base)
+  assert.equal(withoutGraph.problems, 0, 'absent membership graph → literal matching, unchanged')
+
+  // um role custom que NÃO é alcançável não deve ser marcado
+  const unrelated = buildResult({
+    ...base,
+    clientRoles: { anon: new Set(['anon']), authenticated: new Set(['authenticated']) },
+  })
+  assert.equal(unrelated.problems, 0, 'a custom role neither anon nor authenticated reaches stays quiet')
+})
+
+// savedBoth (P1 da re-auditoria — controle vivo sem teste) — no ramo de escrita
+// SEM WITH CHECK, o USING é TANTO o filtro de linha QUANTO o check. Uma
+// restrictive que estreita só o lado check (mas deixa o USING aberto) NÃO torna
+// a escrita segura: o USING true ainda deixa qualquer linha ser alvo. Só há
+// resgate quando os DOIS lados são estreitados.
+test('#write a check-only restrictive does not rescue an open USING with no WITH CHECK', () => {
+  const res = buildResult({
+    schema: 'public', allTables: [{ tablename: 'notes' }],
+    policies: [
+      policy({ tablename: 'notes', policyname: 'open', cmd: 'UPDATE', roles: '{anon}', qual: 'true', with_check: null }),
+      { tablename: 'notes', policyname: 'r', permissive: 'RESTRICTIVE', cmd: 'UPDATE', roles: '{anon}', qual: 'true', with_check: 'owner = auth.uid()' },
+    ],
+    grants: [{ table_name: 'notes', grantee: 'anon', privilege_type: 'UPDATE' }],
+  })
+  assert.ok(res.problems > 0, 'USING(true) + no WITH CHECK is not rescued by a restrictive that scopes only the check side')
+
+  // e o resgate LEGÍTIMO (restrictive estreita o USING) continua rebaixando
+  const rescued = buildResult({
+    schema: 'public', allTables: [{ tablename: 'notes' }],
+    policies: [
+      policy({ tablename: 'notes', policyname: 'open', cmd: 'UPDATE', roles: '{anon}', qual: 'true', with_check: null }),
+      { tablename: 'notes', policyname: 'r', permissive: 'RESTRICTIVE', cmd: 'UPDATE', roles: '{anon}', qual: 'owner = auth.uid()', with_check: 'owner = auth.uid()' },
+    ],
+    grants: [{ table_name: 'notes', grantee: 'anon', privilege_type: 'UPDATE' }],
+  })
+  assert.equal(rescued.problems, 0, 'a restrictive that scopes the USING legitimately narrows the write')
+})
