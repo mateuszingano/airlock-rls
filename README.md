@@ -5,6 +5,8 @@
 
 > **Scanners check that a policy exists. Airlock proves it works — and blocks the merge if it doesn't.**
 
+**Guides, the live demo and the hosted monitor:** [shipsealed.com](https://shipsealed.com) · [Supabase RLS guides](https://shipsealed.com/rls/) · [service_role key scanner](https://shipsealed.com/service-role-scanner/)
+
 Airlock fails your CI when a table ships without Row Level Security, or when a
 policy is **permissive** (`USING (true)` / `WITH CHECK (true)` — the always-true
 rules that let every API role through and quietly defeat tenant isolation).
