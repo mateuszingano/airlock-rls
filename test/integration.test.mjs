@@ -109,3 +109,21 @@ test('C1: a leak is still caught when the audit runs as a restricted role', gate
   )
   assert.equal(result.passed, false, 'a restricted-role audit of a leaky schema must not pass')
 })
+
+// A column grant (`grant select (id, card) on t to anon`) is invisible to
+// has_table_privilege(), yet PostgREST serves those columns. Before 0.4.3 a
+// USING (true) policy behind one, and a matview granted by column, audited clean.
+test('column grants: a USING (true) table and a matview reached by column are caught', gate, async () => {
+  await loadFixture('column-grant.sql')
+  const result = await audit({ dbUrl: DB_URL, schema: 'colgrant' })
+  const fails = result.findings.filter((f) => f.severity === 'fail')
+  assert.ok(
+    fails.some((f) => f.kind === 'permissive_true' && f.object.startsWith('cards.')),
+    `expected a permissive_true fail on "cards", got: ${JSON.stringify(fails)}`
+  )
+  assert.ok(
+    fails.some((f) => f.kind === 'matview_exposed' && f.object === 'matview:cards_dump'),
+    `expected a matview_exposed fail on "cards_dump", got: ${JSON.stringify(fails)}`
+  )
+  assert.equal(result.passed, false)
+})

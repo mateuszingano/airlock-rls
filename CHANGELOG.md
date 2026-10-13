@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.3 — 2026-10-13
+
+- **Fix (false negative): exposure through COLUMN grants.** `grant select (id, card) on t to anon`
+  is invisible to `has_table_privilege()`, but PostgREST serves those columns. A table with
+  RLS on and a `USING (true)` policy behind a column grant audited clean (zero findings)
+  while anon read every row, and a materialized view granted by column audited clean too.
+  Grants are now read with `has_any_column_privilege()` as well (SELECT/INSERT/UPDATE;
+  DELETE has no column form). Covered by a new integration test (`column-grant.sql`)
+  that fails on 0.4.2.
+
 ## 0.4.2 — 2026-10-13
 
 - New export `airlock-rls/service-role` (`scanSiteForServiceRole` and helpers), so the

@@ -1026,7 +1026,14 @@ export async function audit({ dbUrl, schema = 'public', allow = [] } = {}) {
           where n.nspname = $1
             and t.relkind in ('r','p')
             and to_regrole(roles.grantee) is not null
-            and has_table_privilege(roles.grantee, t.oid, privs.privilege_type)`,
+            and (has_table_privilege(roles.grantee, t.oid, privs.privilege_type)
+                 -- A COLUMN grant (grant select (id, card) on t to anon) is
+                 -- invisible to has_table_privilege, yet PostgREST serves those
+                 -- columns: a USING (true) policy behind it audited clean while
+                 -- anon read the card numbers (proven 13/10/26). DELETE has no
+                 -- column form.
+                 or (privs.privilege_type <> 'DELETE'
+                     and has_any_column_privilege(roles.grantee, t.oid, privs.privilege_type)))`,
         [schema]
       )
       grants = res.rows
@@ -1131,8 +1138,8 @@ export async function audit({ dbUrl, schema = 'public', allow = [] } = {}) {
     // FROM private_t` + `GRANT SELECT TO anon` audited perfectly clean.
     const { rows: matviews } = await client.query(
       `select c.relname as matviewname,
-              coalesce(to_regrole('anon') is not null and has_table_privilege('anon', c.oid, 'SELECT'), false) as anon_select,
-              coalesce(to_regrole('authenticated') is not null and has_table_privilege('authenticated', c.oid, 'SELECT'), false) as auth_select
+              coalesce(to_regrole('anon') is not null and has_any_column_privilege('anon', c.oid, 'SELECT'), false) as anon_select,
+              coalesce(to_regrole('authenticated') is not null and has_any_column_privilege('authenticated', c.oid, 'SELECT'), false) as auth_select
          from pg_class c join pg_namespace n on n.oid = c.relnamespace
         where n.nspname = $1 and c.relkind = 'm'
         order by c.relname`,
