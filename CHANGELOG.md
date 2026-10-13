@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.2 — 2026-10-13
+
+- New export `airlock-rls/service-role` (`scanSiteForServiceRole` and helpers), so the
+  MCP server (`airlock-rls-mcp`) uses the published engine instead of a copy.
+
+## 0.4.1 — 2026-10-13
+
+- `homepage` points to shipsealed.com; README links to the guides and live demo. No code change.
+
 ## 0.4.0 — 2026-07-20 — BREAKING
 
 Findings from the 20/07 re-audit. Each made the gate report a real exposure as a
