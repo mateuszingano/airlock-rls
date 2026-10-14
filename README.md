@@ -5,7 +5,7 @@
 
 > **Scanners check that a policy exists. Airlock proves it works — and blocks the merge if it doesn't.**
 
-**Guides, the live demo and the hosted monitor:** [shipsealed.com](https://shipsealed.com) · [Supabase RLS guides](https://shipsealed.com/rls/) · [service_role key scanner](https://shipsealed.com/service-role-scanner/)
+**Guides, the live demo and the hosted monitor:** [shipsealed.com](https://shipsealed.com/?utm_source=readme&utm_medium=referral&utm_campaign=airlock-rls) · [Supabase RLS guides](https://shipsealed.com/rls/?utm_source=readme&utm_medium=referral&utm_campaign=airlock-rls) · [service_role key scanner](https://shipsealed.com/service-role-scanner/?utm_source=readme&utm_medium=referral&utm_campaign=airlock-rls)
 
 Airlock fails your CI when a table ships without Row Level Security, or when a
 policy is **permissive** (`USING (true)` / `WITH CHECK (true)` — the always-true
