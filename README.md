@@ -1,27 +1,60 @@
 # Airlock RLS — the CI gate for Supabase
 
 [![test](https://github.com/mateuszingano/airlock-rls/actions/workflows/test.yml/badge.svg)](https://github.com/mateuszingano/airlock-rls/actions/workflows/test.yml)
+[![npm](https://img.shields.io/npm/v/airlock-rls.svg)](https://www.npmjs.com/package/airlock-rls)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 > **Scanners check that a policy exists. Airlock proves it works — and blocks the merge if it doesn't.**
 
-**Guides, the live demo and the hosted monitor:** [shipsealed.com](https://shipsealed.com/?utm_source=readme&utm_medium=referral&utm_campaign=airlock-rls) · [Supabase RLS guides](https://shipsealed.com/rls/?utm_source=readme&utm_medium=referral&utm_campaign=airlock-rls) · [service_role key scanner](https://shipsealed.com/service-role-scanner/?utm_source=readme&utm_medium=referral&utm_campaign=airlock-rls)
+Airlock fails your build when a Supabase table ships with Row Level Security off,
+or with a policy that is enabled but lets everyone through. `USING (true)` is the
+obvious one; `auth.uid() = owner_id OR 1 = 1` does the same thing and passes
+every "is RLS enabled?" check.
 
-Airlock fails your CI when a table ships without Row Level Security, or when a
-policy is **permissive** (`USING (true)` / `WITH CHECK (true)` — the always-true
-rules that let every API role through and quietly defeat tenant isolation).
+## Try it in 30 seconds
 
-It's not another scanner you read a report from. It's a **gate**: the migration
-doesn't reach production with an exposed table.
+```bash
+# audit your database (a read-only role is enough: it reads catalog metadata, never your rows)
+npx airlock-rls "$SUPABASE_DB_URL"
+
+# no database? scan your deployed app for a leaked service_role key
+npx airlock-rls --site https://your-app.com
+```
+
+Real output against a test schema:
+
+```
+✗ 3 problem(s) in "public":
+    ✗ profiles table in "public" has RLS DISABLED — every row is exposed to the API roles
+    ✗ documents."own docs" [SELECT] USING (((auth.uid() = owner_id) OR (1 = 1))) always evaluates true — anon reads every row
+    ✗ invoices."public read" [SELECT] USING(true) — anon reads every row
+
+RLS audit failed: 3 problem(s) found.
+```
+
+Exit code `1`, so the same command blocks a merge in CI ([GitHub Action below](#use-it-as-a-github-action-the-gate)).
+
+## How it works
+
+1. **Reads the catalog** — `pg_tables`, `pg_policies`, grants, views, functions.
+   It only reports a table a client role can actually reach (it checks the grants),
+   so a locked-down table doesn't cry wolf.
+2. **Parses each policy expression** into an AST and decides whether it really
+   scopes rows to the caller, instead of matching strings. Shapes it can't prove
+   become a warning, never a silent pass.
+3. **Optionally proves it (DAST)** — add `--url` and `--anon-key` next to the DB
+   URL and it reads every table over the REST API as an anonymous user. A row
+   coming back is a proven leak, not a guess.
+
+**Why now:** on Oct 30, 2026 Supabase stops auto-granting new tables to `anon` /
+`authenticated`. The quickest fix for the first `permission denied` is
+`grant ... on all tables in schema public`, which also grants every table that has
+RLS off. That is exactly what Airlock fails on.
+([Write-up of the change](https://shipsealed.com/rls/supabase-october-30-grants-change/?utm_source=readme&utm_medium=referral&utm_campaign=airlock-rls))
+
+**More:** [live demo](https://shipsealed.com/demo/?utm_source=readme&utm_medium=referral&utm_campaign=airlock-rls) · [Supabase RLS guides](https://shipsealed.com/rls/?utm_source=readme&utm_medium=referral&utm_campaign=airlock-rls) · [browser scanner, no install](https://shipsealed.com/service-role-scanner/?utm_source=readme&utm_medium=referral&utm_campaign=airlock-rls)
 
 ---
-
-## Why this exists
-
-The #1 Supabase security footgun is shipping a table to the `public` schema
-with RLS off, or a policy that's technically present but logically wide open.
-Native advisors and free scanners tell you *after the fact*. Airlock runs in CI
-and **fails the build**, so the leak never merges.
 
 ## What it checks
 
@@ -293,13 +326,11 @@ It never exits the process — you decide how to report.
 
 ## What's free vs. paid
 
-Airlock is **open core**. This gate — the CLI and the GitHub Action — is free
-and MIT-licensed, forever. Paid tiers (coming) add the pieces a one-shot CI run
-can't cover:
-
-- **Logic audit** — deeper policy analysis beyond always-true.
-- **Continuous monitoring** — a scheduled run that alerts on *drift* when a new
-  migration reopens a hole between CI runs.
+This gate (the CLI, the GitHub Action and the library) is free and MIT-licensed,
+forever. For what a one-shot CI run can't cover, there is
+[Airlock Monitor](https://shipsealed.com/#monitor): a hosted, scheduled run that
+alerts you when a migration reopens a hole between CI runs. It has a free plan
+(one project, weekly) and a paid one.
 
 ## Development
 
