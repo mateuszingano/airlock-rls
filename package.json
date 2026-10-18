@@ -51,7 +51,7 @@
   "bugs": {
     "url": "https://github.com/mateuszingano/airlock-rls/issues"
   },
-  "homepage": "https://shipsealed.com/?utm_source=npm&utm_medium=referral&utm_campaign=airlock-rls",
+  "homepage": "https://shipsealed.com",
   "license": "MIT",
   "dependencies": {
     "pg": "^8.13.0",
