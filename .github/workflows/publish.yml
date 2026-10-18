@@ -55,4 +55,4 @@ jobs:
             echo "already=true" >> "$GITHUB_OUTPUT"; echo "::notice::airlock-rls@$v is already published"
           fi
       - if: steps.check.outputs.already != 'true'
-        run: npm publish
+        run: npm publish --loglevel verbose
