@@ -36,8 +36,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-          # No registry-url: it writes _authToken=${NODE_AUTH_TOKEN} to .npmrc,
-          # which (empty, since we use OIDC) gets the publish PUT rejected 403.
+          # No registry-url: OIDC needs no .npmrc token (default registry).
       # Trusted Publishing needs npm >= 11.5.1; `npm stage` needs >= 11.15.0.
       - run: npm install -g npm@^11.15.0
       - run: npm install --no-audit --no-fund
