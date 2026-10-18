@@ -55,6 +55,4 @@ jobs:
             echo "already=true" >> "$GITHUB_OUTPUT"; echo "::notice::airlock-rls@$v is already published"
           fi
       - if: steps.check.outputs.already != 'true'
-        # Staged: the version waits in npm's queue until a maintainer approves it
-        # on npmjs.com with 2FA (a security key works there; --otp can't).
-        run: npm stage publish --loglevel verbose
+        run: npm publish --loglevel verbose
