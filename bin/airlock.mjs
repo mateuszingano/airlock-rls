@@ -164,7 +164,7 @@ async function readVersion() {
   }
 }
 
-function report(result) {
+function report(result, { dbAudited = true } = {}) {
   const fails = result.findings.filter((f) => f.severity === 'fail')
   const warns = result.findings.filter((f) => f.severity === 'warn')
 
@@ -172,7 +172,12 @@ function report(result) {
     console.log(`${RED}✗ ${fails.length} problem(s) in "${result.schema}":${RESET}`)
     for (const f of fails) console.log(`    ${RED}✗${RESET} ${f.object} ${DIM}${f.detail}${RESET}`)
   } else {
-    console.log(`${GREEN}✓ No RLS problems in "${result.schema}".${RESET}`)
+    // A --site-only run never touched a database, so it must not claim the
+    // schema is clean; say what was actually looked at.
+    if (dbAudited) console.log(`${GREEN}✓ No RLS problems in "${result.schema}".${RESET}`)
+    if (result.siteScan) {
+      console.log(`${GREEN}✓ No service key exposed on ${result.siteScan.url} (${result.siteScan.scanned} file(s) scanned).${RESET}`)
+    }
   }
 
   if (warns.length) {
@@ -190,7 +195,7 @@ function report(result) {
 
   if (result.gatePassed) {
     const tail = warns.length ? ` ${DIM}(${warns.length} warning(s))${RESET}` : ''
-    console.log(`\n${GREEN}RLS audit passed.${RESET}${tail}`)
+    console.log(`\n${GREEN}${dbAudited ? 'RLS audit' : 'Site scan'} passed.${RESET}${tail}`)
     // Eleven of the rules only ever emit `warn`. Saying nothing here lets a
     // reader assume "passed" means "nothing worth acting on" — including for
     // an `authenticated` tenant leak, which is a warn today.
@@ -199,7 +204,7 @@ function report(result) {
     }
   } else {
     const what = result.problems ? `${result.problems} problem(s) found` : `${warns.length} warning(s) with --fail-on warn`
-    console.log(`\n${RED}RLS audit failed: ${what}.${RESET}`)
+    console.log(`\n${RED}${dbAudited ? 'RLS audit' : 'Site scan'} failed: ${what}.${RESET}`)
   }
 }
 
@@ -262,7 +267,15 @@ async function main() {
   // Site scan: a service_role key shipped to the browser bypasses ALL RLS —
   // the worst leak there is. Needs only the deployed site URL (no DB).
   if (opts.site) {
-    const { findings, scanned } = await scanSiteForServiceRole({ siteUrl: opts.site, ...(opts.maxScripts != null ? { maxScripts: opts.maxScripts } : {}) })
+    let scan
+    try {
+      scan = await scanSiteForServiceRole({ siteUrl: opts.site, ...(opts.maxScripts != null ? { maxScripts: opts.maxScripts } : {}) })
+    } catch (err) {
+      // A bare "fetch failed" doesn't say which URL, or that nothing was
+      // scanned. Still exits 2: never a false pass.
+      throw new Error(`Couldn't scan ${opts.site}: ${err.cause?.code || err.message}`)
+    }
+    const { findings, scanned } = scan
     result.siteScan = { scanned, url: opts.site }
     if (findings.length) {
       result.findings.push(...findings)
@@ -282,7 +295,7 @@ async function main() {
     console.log(JSON.stringify(result, null, 2))
   } else {
     if (result.dast) console.log(`${DIM}(DAST: probed ${result.dast.probed} table(s) with the anon key)${RESET}`)
-    report(result)
+    report(result, { dbAudited: Boolean(opts.dbUrl) })
   }
 
   return result.gatePassed ? 0 : 1

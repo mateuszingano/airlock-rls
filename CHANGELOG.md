@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.4 — 2026-10-18
+
+- **`--site` on its own no longer says "No RLS problems in public".** It never touched a
+  database, so it now reports what it did look at: `✓ No service key exposed on <url>
+  (N file(s) scanned)` and `Site scan passed.`
+- **An unreachable `--site` names the URL:** `Couldn't scan <url>: ENOTFOUND` instead of a
+  bare `fetch failed`. Still exit code 2, never a pass.
+- The `authenticated_unscoped` warning said "(no auth.uid())" next to a policy such as
+  `auth.uid() IS NOT NULL`. It now says "(not scoped to the row owner)".
+- README: 30-second quickstart with real output, "How it works", Airlock Monitor replaces
+  the stale "paid tiers (coming)".
+
 ## 0.4.3 — 2026-10-13
 
 - **Fix (false negative): exposure through COLUMN grants.** `grant select (id, card) on t to anon`

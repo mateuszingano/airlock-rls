@@ -416,7 +416,7 @@ export function classifyPolicy(p, ctx = {}) {
         // when the openness is deliberate (a shared feed, a public directory).
         severity: literal && !saved ? 'fail' : 'warn',
         object,
-        detail: `[${cmd}] any authenticated user reads all rows${literal ? ` — ${how}` : ` (no auth.uid()) — USING (${short(p.qual)})`}${saved ? ' (restrictive-narrowed — verify)' : ''}`,
+        detail: `[${cmd}] any authenticated user reads all rows${literal ? ` — ${how}` : ` (not scoped to the row owner) — USING (${short(p.qual)})`}${saved ? ' (restrictive-narrowed — verify)' : ''}`,
       })
     }
   }
