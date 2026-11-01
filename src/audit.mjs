@@ -263,6 +263,35 @@ function nsAllowed(allowSet, used, ns, ...names) {
   return null
 }
 
+// pg_proc.proconfig is a text[] of `key=value` per-function settings (or null).
+// A SECURITY DEFINER function is safe from search_path hijacking only when it
+// pins `search_path`. Accepts the parsed array OR the raw wire string `{...}`.
+// `undefined` means the column was not queried (older callers) — unknown, not
+// "mutable" — so this returns true to suppress the check in that case; callers
+// gate on `proconfig !== undefined` before asking.
+function hasPinnedSearchPath(proconfig) {
+  if (proconfig == null) return false
+  const arr = typeof proconfig === 'string'
+    ? proconfig.replace(/^\{|\}$/g, '').split(',')
+    : proconfig
+  // pg always hands back a text[] (array) or null; a caller that normalises it
+  // to some other type must not crash the whole audit — treat it as unpinned.
+  if (!Array.isArray(arr)) return false
+  return arr.some((e) => /^\s*"?search_path"?\s*=/i.test(String(e)))
+}
+
+// Roles Supabase (or Postgres itself) manages and that legitimately hold
+// BYPASSRLS / SUPERUSER on every project — flagging them would be pure noise.
+// A role OUTSIDE this set with bypass powers is the real signal.
+const MANAGED_BYPASS_ROLES = new Set([
+  'postgres', 'service_role', 'supabase_admin', 'authenticator',
+  'pgbouncer', 'dashboard_user', 'pgsodium_keyholder',
+])
+function isManagedRole(name) {
+  const n = String(name).toLowerCase()
+  return MANAGED_BYPASS_ROLES.has(n) || n.startsWith('pg_') || n.startsWith('supabase_')
+}
+
 /**
  * Does `role` actually hold `priv` on this table? grants is
  * { anon: Set<priv>, authenticated: Set<priv> } or null (unknown → assume yes,
@@ -633,12 +662,31 @@ export function buildResult({
   matviews = [],
   storagePolicies = [],
   realtimeTables = [],
+  bypassRoles = [],
+  tableOwners = [],
   grants = null,
   clientRoles = null,
   allow = new Set(),
   skipped = [],
 } = {}) {
   const allowSet = allow instanceof Set ? allow : new Set(allow)
+
+  // A table's owner bypasses its own RLS (unless FORCE ROW LEVEL SECURITY). The
+  // danger is only when that owner is a role the API caller can reach — anon,
+  // authenticated, or any role granted to them. On stock Supabase the owner is
+  // `postgres`, which no client can assume, so this stays silent.
+  const CLIENT_REACHABLE = new Set(['anon', 'authenticated', 'public'])
+  const ownerIsClientReachable = (owner) => {
+    const o = String(owner).toLowerCase()
+    if (CLIENT_REACHABLE.has(o)) return true
+    if (clientRoles) {
+      for (const k of ['anon', 'authenticated']) {
+        const arr = clientRoles[k]
+        if (Array.isArray(arr) && arr.some((x) => String(x).toLowerCase() === o)) return true
+      }
+    }
+    return false
+  }
 
   // Grants map (only if grant data was provided). Absent → classifyPolicy assumes
   // granted, to avoid false negatives when we couldn't read privileges.
@@ -769,6 +817,23 @@ export function buildResult({
       noteBare('fn', fn.proname)
       findings.push(f)
     }
+    // Orthogonal to WHO can call it: a definer function with no pinned
+    // search_path resolves unqualified names against the caller's search_path,
+    // so a caller can shadow a referenced object and run their code as the
+    // owner. Only checked when proconfig was actually queried (back-compat).
+    if (fn.proconfig !== undefined && !hasPinnedSearchPath(fn.proconfig)) {
+      const who = anonExec ? ' anon can EXECUTE it'
+        : authExec ? ' any authenticated user can EXECUTE it'
+        : ''
+      const sf = {
+        kind: 'definer_search_path_mutable',
+        severity: 'warn',
+        object: `fn:${fn.proname}`,
+        detail: `SECURITY DEFINER function has no pinned search_path — it resolves unqualified names against the caller's search_path, a privilege-escalation path (Supabase advisor: function_search_path_mutable).${who ? who + '.' : ''} Set it, e.g. ALTER FUNCTION ${fn.proname} SET search_path = ''.`,
+      }
+      if (nsAllowed(allowSet, usedAllow, 'fn', fn.proname)) allowed.push(sf)
+      else findings.push(sf) // noteBare already recorded above for this fn
+    }
   }
   // Storage object-level policies (storage.objects) — same logic, prefixed.
   for (const p of storagePolicies) {
@@ -836,6 +901,52 @@ export function buildResult({
     }
   }
 
+  // Roles that bypass RLS entirely (BYPASSRLS / SUPERUSER). RLS never runs for
+  // such a role, so if anything the client can reach runs as it, every policy
+  // on every table is skipped. We silence the Supabase/Postgres-managed roles
+  // (postgres, service_role, supabase_*, pg_*) to avoid noise — BUT the
+  // `supabase_` prefix is NOT reserved, so a role the client can actually reach
+  // is flagged regardless of its name: that is the dangerous case, and a
+  // backdoor named to blend in must not hide behind the prefix.
+  for (const role of bypassRoles) {
+    const reachable = ownerIsClientReachable(role.rolname)
+    if (!reachable && isManagedRole(role.rolname)) continue
+    const why = (role.rolsuper === true || role.rolsuper === 'true') ? 'is a SUPERUSER' : 'has BYPASSRLS'
+    const f = {
+      kind: 'bypassrls_role',
+      severity: 'warn',
+      object: `role:${role.rolname}`,
+      detail: reachable
+        ? `role "${role.rolname}" ${why} AND is reachable by the API caller — RLS never applies to it, so every policy on every table is bypassed for anyone who can reach it. This is almost certainly a mistake.`
+        : `role "${role.rolname}" ${why} — RLS never applies to it. Confirm nothing the API can reach connects or runs as this role; if it does, every policy on every table is bypassed.`,
+    }
+    if (nsAllowed(allowSet, usedAllow, 'role', role.rolname)) allowed.push(f)
+    else {
+      noteBare('role', role.rolname)
+      findings.push(f)
+    }
+  }
+
+  // A table whose OWNER is a role the client can reach: the owner bypasses its
+  // own RLS unless FORCE ROW LEVEL SECURITY is set, so the policies on it do
+  // not constrain the owner. On stock Supabase the owner is `postgres` (not
+  // client-reachable), so this is silent there.
+  for (const t of tableOwners) {
+    if (t.rls_forced === true || t.rls_forced === 'true') continue
+    if (!ownerIsClientReachable(t.owner)) continue
+    const f = {
+      kind: 'owner_bypasses_rls',
+      severity: 'warn',
+      object: `table:${t.tablename}`,
+      detail: `table "${t.tablename}" is owned by "${t.owner}", a role the API can reach — the owner bypasses RLS (no FORCE ROW LEVEL SECURITY), so its policies do not constrain it. Reassign the owner, or ALTER TABLE ${t.tablename} FORCE ROW LEVEL SECURITY.`,
+    }
+    if (nsAllowed(allowSet, usedAllow, 'table', t.tablename)) allowed.push(f)
+    else {
+      noteBare('table', t.tablename)
+      findings.push(f)
+    }
+  }
+
   // A bare name that would have silenced a non-policy object no longer does.
   // Say so with the exact spelling to use, instead of leaving the author to
   // believe the finding was waived.
@@ -867,6 +978,8 @@ export function buildResult({
   for (const v of views) existingTargets.add(`view:${v.viewname}`)
   for (const mv of matviews) existingTargets.add(`matview:${mv.matviewname}`)
   for (const t of realtimeTables) existingTargets.add(`realtime:${t.tablename || t}`)
+  for (const role of bypassRoles) if (ownerIsClientReachable(role.rolname) || !isManagedRole(role.rolname)) existingTargets.add(`role:${role.rolname}`)
+  for (const t of tableOwners) existingTargets.add(`table:${t.tablename}`)
 
   // An --allow entry that names nothing at all is a stale waiver: the object was
   // renamed or dropped, and the entry now protects nothing while reading like it
@@ -1076,6 +1189,7 @@ export async function audit({ dbUrl, schema = 'public', allow = [] } = {}) {
     // code is the real danger).
     const { rows: secDefFns } = await client.query(
       `select p.proname,
+              p.proconfig,
               coalesce(to_regrole('anon') is not null and has_function_privilege('anon', p.oid, 'EXECUTE'), false) as anon_exec,
               coalesce(to_regrole('authenticated') is not null and has_function_privilege('authenticated', p.oid, 'EXECUTE'), false) as auth_exec
          from pg_proc p join pg_namespace n on n.oid = p.pronamespace
@@ -1152,7 +1266,30 @@ export async function audit({ dbUrl, schema = 'public', allow = [] } = {}) {
       )
       return rows
     })
-    return buildResult({ schema, noRls, policies, allTables, publicBuckets, secDefFns, views, matviews, storagePolicies, realtimeTables, grants, clientRoles, allow, skipped })
+    // Roles that bypass RLS entirely (BYPASSRLS / SUPERUSER). Not schema-scoped;
+    // optional because a restricted audit role may not read pg_roles.
+    const bypassRoles = await optional('bypassrls roles', async () => {
+      const { rows } = await client.query(
+        `select rolname, rolbypassrls, rolsuper from pg_roles
+          where rolbypassrls or rolsuper order by rolname`
+      )
+      return rows
+    })
+    // Table owners in the audited schema — an owner the client can reach
+    // bypasses RLS unless the table FORCEs it.
+    const tableOwners = await optional('table owners', async () => {
+      const { rows } = await client.query(
+        `select c.relname as tablename,
+                pg_get_userbyid(c.relowner) as owner,
+                c.relforcerowsecurity as rls_forced
+           from pg_class c join pg_namespace n on n.oid = c.relnamespace
+          where n.nspname = $1 and c.relkind in ('r','p')
+          order by c.relname`,
+        [schema]
+      )
+      return rows
+    })
+    return buildResult({ schema, noRls, policies, allTables, publicBuckets, secDefFns, views, matviews, storagePolicies, realtimeTables, bypassRoles, tableOwners, grants, clientRoles, allow, skipped })
   } finally {
     await client.end()
   }

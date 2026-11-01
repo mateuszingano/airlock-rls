@@ -119,10 +119,23 @@ Airlock audits the *logic* of your policies, not just their presence.
   hand. Only a `201` (a row actually inserted) is reported as a proven write leak.
 - **`public_bucket`** — a public storage bucket.
 - **`security_definer`** — a function that runs as its owner and can bypass RLS.
+- **`definer_search_path_mutable`** — a SECURITY DEFINER function with no pinned
+  `search_path`. It resolves unqualified names against the *caller's* search_path,
+  so a caller can shadow a referenced object and run code as the function's owner
+  (Supabase advisor: `function_search_path_mutable`). Fix with
+  `ALTER FUNCTION f SET search_path = ''`.
+- **`bypassrls_role`** — a role with `BYPASSRLS` or `SUPERUSER` outside the
+  Supabase-managed set (`postgres`, `service_role`, `supabase_*`, `pg_*`…), **or
+  any bypass role the API caller can reach, whatever its name** (the `supabase_`
+  prefix is not reserved, so a backdoor can't hide behind it). RLS never applies
+  to such a role; if the client reaches it, every policy is skipped. Allow-list
+  it (`role:<name>`) if it is a deliberate admin role.
+- **`owner_bypasses_rls`** — a table whose **owner** is a role the API can reach
+  (`anon`, `authenticated`, or a role granted to them). The owner bypasses its own
+  RLS unless the table sets `FORCE ROW LEVEL SECURITY`. Reassign the owner or
+  `ALTER TABLE t FORCE ROW LEVEL SECURITY`.
 
 **What it does NOT cover yet (declared, not silently missed):**
-- **`FORCE ROW LEVEL SECURITY` is never read** — only `rowsecurity`. A table
-  whose owner is reachable keeps a silent bypass.
 - **`--site` does not defeat DNS rebinding.** Literal private, loopback,
   link-local and metadata addresses are refused (including their IPv4-mapped
   IPv6 spellings), and every fetch has a timeout and a body cap. Redirects are
@@ -158,7 +171,8 @@ Airlock audits the *logic* of your policies, not just their presence.
   views, SECURITY DEFINER functions and realtime tables live in their own
   namespaces and must be qualified the same way the finding prints them:
   `storage:receipts`, `view:reports`, `matview:reports`, `fn:is_admin`,
-  `realtime:orders`. One flat name used to silence all of them at once, so
+  `realtime:orders`, `role:reporting`, `table:notes`. One flat name used to
+  silence all of them at once, so
   `--allow reports` could mute a matview FAIL the author never looked at. A bare
   name that would have matched raises `allow_needs_namespace` and waives nothing.
 - **An `--allow` entry that matches nothing raises `allow_unused`.** A waiver

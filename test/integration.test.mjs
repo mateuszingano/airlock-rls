@@ -127,3 +127,18 @@ test('column grants: a USING (true) table and a matview reached by column are ca
   )
   assert.equal(result.passed, false)
 })
+
+test('hardening: mutable search_path, a custom BYPASSRLS role and a client-owned table are flagged', gate, async () => {
+  await loadFixture('hardening.sql')
+  const result = await audit({ dbUrl: DB_URL, schema: 'hardening' })
+  const has = (kind, object) => result.findings.some((f) => f.kind === kind && f.object === object)
+
+  assert.ok(has('definer_search_path_mutable', 'fn:mutable_fn'),
+    `expected definer_search_path_mutable on mutable_fn, got: ${JSON.stringify(result.findings)}`)
+  assert.ok(!has('definer_search_path_mutable', 'fn:pinned_fn'),
+    'pinned_fn pins search_path and must NOT be flagged for it')
+  assert.ok(has('bypassrls_role', 'role:hardening_bypass'),
+    `expected bypassrls_role on hardening_bypass, got: ${JSON.stringify(result.findings)}`)
+  assert.ok(has('owner_bypasses_rls', 'table:owned_by_authed'),
+    `expected owner_bypasses_rls on owned_by_authed, got: ${JSON.stringify(result.findings)}`)
+})

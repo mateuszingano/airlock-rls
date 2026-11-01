@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.0 — 2026-11-01
+
+Three hardening checks, all **warns** (gate stays the same unless you run
+`--fail-on warn`), added after a review of a competitor's audit coverage:
+
+- **`definer_search_path_mutable`** — a SECURITY DEFINER function with no pinned
+  `search_path`. Unqualified names resolve against the caller's search_path, a
+  privilege-escalation path the old audit (which only checked *who* could call a
+  definer function) missed. Reads `pg_proc.proconfig`; silent when the column is
+  not queried, so older callers of `buildResult` are unaffected.
+- **`bypassrls_role`** — a role with `BYPASSRLS`/`SUPERUSER` outside the
+  Supabase-managed set (`postgres`, `service_role`, `supabase_*`, `pg_*`,
+  `authenticator`, `pgbouncer`, …). Stays quiet on a stock project; flags a
+  custom bypass role. A bypass role the client can actually reach is flagged
+  **regardless of its name** — the `supabase_` prefix is not reserved, so a
+  backdoor can't hide behind it. Waive with `role:<name>`.
+- **`owner_bypasses_rls`** — a table owned by a client-reachable role
+  (`anon`/`authenticated`/granted to them) without `FORCE ROW LEVEL SECURITY`:
+  the owner bypasses its own policies. Closes the long-declared "FORCE ROW LEVEL
+  SECURITY is never read" gap in the README. Waive with `table:<name>`.
+
 ## 0.4.4 — 2026-10-18
 
 - **`--site` on its own no longer says "No RLS problems in public".** It never touched a

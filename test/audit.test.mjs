@@ -352,6 +352,93 @@ test('a SECURITY DEFINER function only the owner can call is just a warning', ()
   assert.equal(r.warnings, 1)
 })
 
+// --- hardening checks added 01/11/26 after a competitor-coverage review
+// (search_path pinning, BYPASSRLS roles, owner-bypass). ---
+
+// #1 SECURITY DEFINER with a mutable search_path = privilege-escalation vector
+// (Supabase advisor: function_search_path_mutable). `proconfig` is the pg_proc
+// per-function settings array; a pinned path shows up as `search_path=...`.
+test('a SECURITY DEFINER function with no pinned search_path is flagged', () => {
+  const r = buildResult({ schema: 'public', secDefFns: [{ proname: 'risky', anon_exec: false, auth_exec: false, proconfig: null }] })
+  assert.ok(kinds(r).includes('definer_search_path_mutable'))
+})
+
+test('a SECURITY DEFINER function WITH a pinned search_path is NOT flagged for it', () => {
+  const r = buildResult({ schema: 'public', secDefFns: [{ proname: 'safe', anon_exec: false, auth_exec: false, proconfig: ['search_path=public'] }] })
+  assert.equal(kinds(r).includes('definer_search_path_mutable'), false)
+})
+
+// Back-compat: proconfig absent (field not queried) must NOT invent a finding,
+// or every existing secDef test (and older callers) would break.
+test('proconfig absent (not queried) adds no search_path finding', () => {
+  const r = buildResult({ schema: 'public', secDefFns: [{ proname: 'legacy' }] })
+  assert.deepEqual(kinds(r), ['security_definer'])
+})
+
+// #2 a role that bypasses RLS (BYPASSRLS / SUPERUSER) beyond the managed set
+test('a custom role with BYPASSRLS is flagged', () => {
+  const r = buildResult({ schema: 'public', allTables: [{ tablename: 't' }], bypassRoles: [{ rolname: 'reporting', rolbypassrls: true, rolsuper: false }] })
+  assert.ok(kinds(r).includes('bypassrls_role'))
+})
+
+test('Supabase-managed bypass roles are NOT flagged (no noise on service_role/postgres)', () => {
+  const r = buildResult({ schema: 'public', allTables: [{ tablename: 't' }], bypassRoles: [
+    { rolname: 'postgres', rolbypassrls: true, rolsuper: true },
+    { rolname: 'service_role', rolbypassrls: true, rolsuper: false },
+    { rolname: 'supabase_admin', rolbypassrls: true, rolsuper: true },
+    { rolname: 'pg_read_all_data', rolbypassrls: true, rolsuper: false },
+  ] })
+  assert.equal(kinds(r).includes('bypassrls_role'), false)
+})
+
+// #3 a table owned by a client-reachable role → the owner bypasses RLS
+test('a table owned by a client-reachable role is flagged (owner bypasses RLS)', () => {
+  const r = buildResult({ schema: 'public', allTables: [{ tablename: 'notes' }], tableOwners: [{ tablename: 'notes', owner: 'authenticated', rls_forced: false }] })
+  assert.ok(kinds(r).includes('owner_bypasses_rls'))
+})
+
+test('a table owned by postgres is NOT flagged for owner-bypass', () => {
+  const r = buildResult({ schema: 'public', allTables: [{ tablename: 'notes' }], tableOwners: [{ tablename: 'notes', owner: 'postgres', rls_forced: false }] })
+  assert.equal(kinds(r).includes('owner_bypasses_rls'), false)
+})
+
+test('a client-owned table with FORCE RLS is NOT flagged (owner no longer bypasses)', () => {
+  const r = buildResult({ schema: 'public', allTables: [{ tablename: 'notes' }], tableOwners: [{ tablename: 'notes', owner: 'authenticated', rls_forced: true }] })
+  assert.equal(kinds(r).includes('owner_bypasses_rls'), false)
+})
+
+// F1 (from the delta audit): the `supabase_` prefix is NOT reserved, so a bypass
+// role the client can actually reach must be flagged even behind that name — a
+// backdoor must not hide by blending in.
+test('a client-reachable BYPASSRLS role is flagged even with a supabase_ name', () => {
+  const r = buildResult({
+    schema: 'public',
+    allTables: [{ tablename: 't' }],
+    bypassRoles: [{ rolname: 'supabase_evil', rolbypassrls: true, rolsuper: false }],
+    clientRoles: { anon: [], authenticated: ['supabase_evil'] },
+  })
+  assert.ok(kinds(r).includes('bypassrls_role'))
+})
+
+// ...but a genuine managed role that is NOT client-reachable stays silent — even
+// one outside the "standard" list (real projects carry supabase_etl_admin). An
+// exact-set allowlist would false-positive here; the prefix + reachability does not.
+test('a non-reachable supabase_-managed role stays silent (no false positive)', () => {
+  const r = buildResult({
+    schema: 'public',
+    allTables: [{ tablename: 't' }],
+    bypassRoles: [{ rolname: 'supabase_etl_admin', rolbypassrls: true, rolsuper: false }],
+  })
+  assert.equal(kinds(r).includes('bypassrls_role'), false)
+})
+
+// F2: proconfig of an unexpected type (never produced by pg, but a reuse-contract
+// caller might) must not crash the whole audit.
+test('a non-array proconfig does not crash the audit', () => {
+  assert.doesNotThrow(() =>
+    buildResult({ schema: 'public', secDefFns: [{ proname: 'weird', proconfig: 5 }] }))
+})
+
 test('a permissive storage.objects policy is flagged (storage-prefixed)', () => {
   const r = buildResult({
     schema: 'public',
