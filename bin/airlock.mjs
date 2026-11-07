@@ -25,6 +25,7 @@ import { scanSiteForServiceRole } from '../src/service-role.mjs'
 import { fuse, extractTable } from '../src/fuse.mjs'
 import { fixPromptFor } from '../src/fix-prompts.mjs'
 import { emitGithubOutputs } from '../src/sarif.mjs'
+import { buildFixSql } from '../src/fix-sql.mjs'
 
 const RESET = '\x1b[0m'
 const RED = '\x1b[31m'
@@ -69,6 +70,10 @@ Options:
   --sarif <file>     Also write a SARIF 2.1.0 log (for GitHub code scanning via
                      github/codeql-action/upload-sarif). The report still prints.
   --format github    Also print ::error/::warning annotations for GitHub Actions.
+  --fix-sql <file>   Write a DRAFT fix migration to <file>: real SQL for the
+                     mechanical fixes (enable RLS, revoke a grant, pin a
+                     search_path...), commented TODO templates for anything
+                     that needs a decision. Review before applying.
   --json             Print the result as JSON instead of a report.
   -h, --help         Show this help.
   -v, --version      Show the version.
@@ -94,6 +99,10 @@ function parseArgs(argv) {
         break
       case '--json':
         opts.json = true
+        break
+      case '--fix-sql':
+        opts.fixSql = argv[++i]
+        if (!opts.fixSql) throw new UsageError('--fix-sql needs a file path, e.g. --fix-sql airlock-fix.sql')
         break
       case '--prompts':
         opts.prompts = true
@@ -140,6 +149,7 @@ function parseArgs(argv) {
         else if (a.startsWith('--site=')) opts.site = a.slice('--site='.length)
         else if (a.startsWith('--sarif=')) opts.sarif = a.slice('--sarif='.length)
         else if (a.startsWith('--format=')) opts.format = a.slice('--format='.length)
+        else if (a.startsWith('--fix-sql=')) opts.fixSql = a.slice('--fix-sql='.length)
         else if (a.startsWith('--max-scripts=')) opts.maxScripts = parseMaxScripts(a.slice('--max-scripts='.length))
         else if (a.startsWith('-')) throw new UsageError(`Unknown option: ${a}`)
         else positional.push(a)
@@ -255,6 +265,16 @@ function report(result, { dbAudited = true, prompts = false } = {}) {
   }
 }
 
+// --fix-sql: write the draft migration. The note goes to stderr under --json so stdout stays valid JSON.
+async function writeFixSql(file, result, quiet) {
+  const { writeFile } = await import('node:fs/promises')
+  const { sql, statements, todos } = buildFixSql(result, { version: await readVersion() })
+  await writeFile(file, sql, 'utf8')
+  const msg = `Draft fix migration written to ${file}: ${statements} statement(s), ${todos} TODO(s). Review it before applying.`
+  if (quiet) console.error(msg)
+  else console.log(`${DIM}${msg}${RESET}`)
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2))
 
@@ -347,6 +367,7 @@ async function main() {
 
   // GitHub-native outputs (SARIF file, workflow annotations) — additive to the report.
   emitGithubOutputs(result, { sarif: opts.sarif, format: opts.format, json: opts.json })
+  if (opts.fixSql) await writeFixSql(opts.fixSql, result, opts.json)
 
   if (opts.json) {
     console.log(JSON.stringify(result, null, 2))
