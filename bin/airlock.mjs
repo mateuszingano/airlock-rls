@@ -24,6 +24,7 @@ import { probeAnonReads, probeAnonWrites } from '../src/dast.mjs'
 import { scanSiteForServiceRole } from '../src/service-role.mjs'
 import { fuse, extractTable } from '../src/fuse.mjs'
 import { fixPromptFor } from '../src/fix-prompts.mjs'
+import { auditMigrations } from '../src/migrations.mjs'
 
 const RESET = '\x1b[0m'
 const RED = '\x1b[31m'
@@ -35,9 +36,17 @@ const HELP = `Airlock — the CI gate for Supabase RLS.
 
 Usage:
   airlock [DB_URL] [options]
+  airlock migrations [PATH...] [options]   (no database, no credentials)
 
 Arguments:
   DB_URL             Postgres connection string. Falls back to $SUPABASE_DB_URL.
+  migrations PATH    Replay SQL migrations (default: supabase/migrations; files
+                     or folders, applied by file name) into an embedded Postgres
+                     and run the same audit. Nothing leaves your machine.
+                     --url/--anon-key/--dast-write/--site don't apply here.
+  --no-default-grants  (migrations) Don't emulate Supabase's auto-grant of new
+                     public tables to anon/authenticated (projects created after
+                     Oct 30, 2026 no longer have it). Default: emulated.
 
 Options:
   --fail-on <level>  What breaks the build: "fail" (default) or "warn". Most
@@ -118,6 +127,9 @@ function parseArgs(argv) {
       case '--max-scripts':
         opts.maxScripts = parseMaxScripts(argv[++i])
         break
+      case '--no-default-grants':
+        opts.defaultGrants = false
+        break
       case '--dast-write':
         opts.dastWrite = true
         break
@@ -133,7 +145,19 @@ function parseArgs(argv) {
         else positional.push(a)
     }
   }
-  opts.dbUrl = positional[0] || process.env.SUPABASE_DB_URL
+  if (positional[0] === 'migrations') {
+    // No-database mode: the rest of the positionals are migration paths, and
+    // the DB/DAST/site flags have nothing to act on. Refuse them rather than
+    // silently ignore them (a user passing --url expects a DAST pass).
+    opts.mode = 'migrations'
+    opts.paths = positional.slice(1).length ? positional.slice(1) : ['supabase/migrations']
+    const bad = [opts.url && '--url', opts.anonKey && '--anon-key', opts.dastWrite && '--dast-write', opts.site && '--site']
+      .filter(Boolean)
+    if (bad.length) throw new UsageError(`${bad.join(', ')} can't be used with "migrations" (no database is contacted).`)
+  } else if (opts.defaultGrants === false) {
+    throw new UsageError('--no-default-grants only applies to "airlock migrations".')
+  }
+  opts.dbUrl = opts.mode === 'migrations' ? undefined : positional[0] || process.env.SUPABASE_DB_URL
   opts.url = opts.url || process.env.SUPABASE_URL
   opts.anonKey = opts.anonKey || process.env.SUPABASE_ANON_KEY
   opts.site = opts.site || process.env.SUPABASE_SITE_URL
@@ -173,13 +197,17 @@ async function readVersion() {
   }
 }
 
+// Where a finding came from, when it is known (the migrations mode traces
+// findings back to the migration file and line that created the object).
+const at = (f) => (f.file ? ` ${DIM}(${f.file}${f.line ? `:${f.line}` : ''})${RESET}` : '')
+
 function report(result, { dbAudited = true, prompts = false } = {}) {
   const fails = result.findings.filter((f) => f.severity === 'fail')
   const warns = result.findings.filter((f) => f.severity === 'warn')
 
   if (fails.length) {
     console.log(`${RED}✗ ${fails.length} problem(s) in "${result.schema}":${RESET}`)
-    for (const f of fails) console.log(`    ${RED}✗${RESET} ${f.object} ${DIM}${f.detail}${RESET}`)
+    for (const f of fails) console.log(`    ${RED}✗${RESET} ${f.object} ${DIM}${f.detail}${RESET}${at(f)}`)
   } else {
     // A --site-only run never touched a database, so it must not claim the
     // schema is clean; say what was actually looked at.
@@ -191,7 +219,7 @@ function report(result, { dbAudited = true, prompts = false } = {}) {
 
   if (warns.length) {
     console.log(`${YELLOW}! ${warns.length} warning(s) worth a look:${RESET}`)
-    for (const f of warns) console.log(`    ${YELLOW}!${RESET} ${f.object} ${DIM}${f.detail}${RESET}`)
+    for (const f of warns) console.log(`    ${YELLOW}!${RESET} ${f.object} ${DIM}${f.detail}${RESET}${at(f)}`)
   }
 
   if (result.allowed.length) {
@@ -249,7 +277,11 @@ async function main() {
     console.log(await readVersion())
     return 0
   }
-  if (!opts.dbUrl && !opts.site) {
+  if (opts.mode === 'migrations') {
+    // No database, no DAST, no site scan (an env-provided site URL is ignored
+    // here: the user asked for an offline run).
+    opts.site = undefined
+  } else if (!opts.dbUrl && !opts.site) {
     console.error('Nothing to audit. Set SUPABASE_DB_URL (or pass it as the first argument)')
     console.error('and/or pass --site <url> to scan a deployed site for an exposed service key.')
     console.error('Run `airlock --help` for usage.')
@@ -258,9 +290,11 @@ async function main() {
 
   // With a DB URL we run the full RLS audit; with only --site we start from a
   // clean slate and add the service-key scan (the zero-setup free hook).
-  let result = opts.dbUrl
-    ? await audit({ dbUrl: opts.dbUrl, schema: opts.schema, allow: opts.allow })
-    : { schema: opts.schema, findings: [], allowed: [], problems: 0, warnings: 0, passed: true, tables: [] }
+  let result = opts.mode === 'migrations'
+    ? await auditMigrations({ paths: opts.paths, schema: opts.schema, allow: opts.allow, defaultGrants: opts.defaultGrants !== false })
+    : opts.dbUrl
+      ? await audit({ dbUrl: opts.dbUrl, schema: opts.schema, allow: opts.allow })
+      : { schema: opts.schema, findings: [], allowed: [], problems: 0, warnings: 0, passed: true, tables: [] }
 
   // DAST pass: prove exposure with the anon key, then FUSE it with the static
   // findings — a live read UPGRADES a static fail to "confirmed" and surfaces
@@ -332,7 +366,16 @@ async function main() {
     console.log(JSON.stringify(result, null, 2))
   } else {
     if (result.dast) console.log(`${DIM}(DAST: probed ${result.dast.probed} table(s) with the anon key)${RESET}`)
-    report(result, { dbAudited: Boolean(opts.dbUrl), prompts: Boolean(opts.prompts) })
+    if (result.migrations) {
+      const m = result.migrations
+      const ext = m.extensionsSkipped.length ? `, ${m.extensionsSkipped.length} extension(s) skipped (${m.extensionsSkipped.join(', ')})` : ''
+      const grants = m.defaultGrants ? '' : ', default grants off'
+      console.log(
+        `${DIM}(migrations: ${m.files.length} file(s), ${m.applied} of ${m.statements} statement(s) loaded into an embedded Postgres, ` +
+          `${m.failed.length} failed${ext}${grants})${RESET}`
+      )
+    }
+    report(result, { dbAudited: Boolean(opts.dbUrl) || opts.mode === 'migrations', prompts: Boolean(opts.prompts) })
   }
 
   return result.gatePassed ? 0 : 1
