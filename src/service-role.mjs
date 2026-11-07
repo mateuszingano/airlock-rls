@@ -78,6 +78,28 @@ export function scanText(text) {
   return hits
 }
 
+// The PUBLIC Supabase key (legacy anon JWT or new sb_publishable_...). Shipping
+// it is normal and is never a finding. But seeing it tells us something useful:
+// this site talks to Supabase from the browser, so Row Level Security is the
+// only thing between a visitor and the tables. The CLI turns that into a nudge
+// to audit the policies, which a site scan cannot see.
+const PUBLISHABLE_KEY_RE = /sb_publishable_[A-Za-z0-9_-]{8,}/
+
+/**
+ * True if the text carries a Supabase public key (anon JWT or sb_publishable_).
+ * Pure, never throws.
+ * @param {string} text
+ * @returns {boolean}
+ */
+export function hasPublicKey(text) {
+  const s = String(text || '')
+  if (PUBLISHABLE_KEY_RE.test(s)) return true
+  for (const m of s.matchAll(JWT_RE)) {
+    if (decodeJwtRole(m[0]) === 'anon') return true
+  }
+  return false
+}
+
 /**
  * Build the single fail Finding for a source that leaked one or more keys. Pure.
  * @param {{type:string, token:string}[]} hits
@@ -239,13 +261,129 @@ async function fetchWithTimeout(fetchImpl, url, init = {}) {
   throw new Error(`Too many redirects (> ${MAX_REDIRECTS}) starting from ${url}.`)
 }
 
+// ---------------------------------------------------------------------------
+// Exposed files: things a static host should never serve but often does after
+// an AI-built deploy. Each check VALIDATES the body, because most SPA hosts
+// answer 200 with index.html for any path; a 200 alone proves nothing.
+// ---------------------------------------------------------------------------
+
+/** A body that is clearly an HTML page (SPA fallback, 404 page), not the file. */
+function looksLikeHtml(body) {
+  return /^\s*(<!doctype|<html|<head|<body|<!--|<script|<meta|<div)/i.test(body)
+}
+
+/**
+ * Is this body a real dotenv file? Counts KEY=value lines; 0 = not a .env
+ * (an HTML fallback page never counts). Pure.
+ * @param {string} body
+ * @returns {number}
+ */
+export function countEnvVars(body) {
+  const s = String(body || '')
+  if (!s.trim() || looksLikeHtml(s)) return 0
+  let n = 0
+  for (const line of s.split(/\r?\n/)) {
+    if (/^\s*(export\s+)?[A-Za-z_][A-Za-z0-9_]*\s*=/.test(line)) n++
+  }
+  return n
+}
+
+/** Is this body the contents of .git/HEAD? Pure. */
+export function isGitHead(body) {
+  return /^(ref: refs\/\S+|[0-9a-f]{40})$/.test(String(body || '').trim())
+}
+
+/** Is this body a JavaScript source map (JSON with mappings + sources)? Pure. */
+export function isSourceMap(body) {
+  const s = String(body || '').trim()
+  if (!s.startsWith('{')) return false
+  try {
+    const j = JSON.parse(s)
+    return typeof j.mappings === 'string' && Array.isArray(j.sources)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * The URL a script's `//# sourceMappingURL=` comment points to, resolved
+ * against the script, or null (none, or an inline data: map). Pure.
+ * @param {string} body
+ * @param {string} scriptUrl
+ * @returns {string|null}
+ */
+export function sourceMapUrlFor(body, scriptUrl) {
+  const m = /\/\/[#@]\s*sourceMappingURL\s*=\s*(\S+)\s*$/m.exec(String(body || '').slice(-2048))
+  if (!m || m[1].startsWith('data:')) return null
+  try {
+    const u = new URL(m[1], scriptUrl)
+    return u.protocol === 'http:' || u.protocol === 'https:' ? u.href : null
+  } catch {
+    return null
+  }
+}
+
+// How many source maps we download to confirm they are public. One proves the
+// point; a few more tell the reader it is the whole build, not a stray file.
+const MAX_SOURCE_MAPS = 3
+
+async function fetchOk(fetchImpl, url, headers) {
+  try {
+    const r = await fetchWithTimeout(fetchImpl, url, { headers })
+    if (!r || r.status !== 200) return null
+    return await bodyText(r)
+  } catch {
+    return null // unreachable / refused redirect: not exposed as far as we can tell
+  }
+}
+
+/**
+ * Probe /.env and /.git/HEAD on the site's origin. Returns fail findings.
+ * Never echoes a value from the .env: only how many variables it holds.
+ */
+async function probeExposedFiles({ siteUrl, fetchImpl, headers }) {
+  const findings = []
+  const origin = new URL(siteUrl).origin
+  const envUrl = `${origin}/.env`
+  const envBody = await fetchOk(fetchImpl, envUrl, headers)
+  const vars = envBody == null ? 0 : countEnvVars(envBody)
+  if (vars > 0) {
+    findings.push({
+      kind: 'env_file_exposed',
+      severity: 'fail',
+      object: envUrl,
+      detail:
+        `Your .env file is downloadable by anyone (${vars} variable(s) in it). Remove it from the deployed site and ` +
+        `rotate every secret it holds — they are already public.`,
+    })
+  }
+  const gitUrl = `${origin}/.git/HEAD`
+  const gitBody = await fetchOk(fetchImpl, gitUrl, headers)
+  if (gitBody != null && isGitHead(gitBody)) {
+    findings.push({
+      kind: 'git_exposed',
+      severity: 'fail',
+      object: `${origin}/.git/`,
+      detail:
+        `Your .git folder is served publicly — anyone can download your source code and its full history, ` +
+        `including any secret ever committed. Keep .git out of the deployed site.`,
+    })
+  }
+  return findings
+}
+
 /**
  * Scan a deployed site (its HTML + JS bundles) for an exposed service key.
  * Needs ONLY the site URL — no database, no credentials.
- * @param {{siteUrl:string, fetchImpl?:Function, maxScripts?:number}} opts
- * @returns {Promise<{findings: import('./audit.mjs').Finding[], scanned:number}>}
+ * With `exposedFiles` (default on) it also checks for a downloadable .env, a
+ * public .git folder and public source maps, each confirmed by content (a 200
+ * alone proves nothing on an SPA host). `publicKeyFound` says the site ships a
+ * Supabase public key, i.e. RLS is the only lock on its tables: not a finding,
+ * a hint for the caller.
+ * @param {{siteUrl:string, fetchImpl?:Function, maxScripts?:number, exposedFiles?:boolean}} opts
+ * @returns {Promise<{findings: import('./audit.mjs').Finding[], scanned:number, publicKeyFound:boolean}>}
  */
-export async function scanSiteForServiceRole({ siteUrl, fetchImpl = fetch, maxScripts = 50 } = {}) {
+export async function scanSiteForServiceRole({ siteUrl, fetchImpl = fetch, maxScripts = 50, exposedFiles = true } = {}) {
   if (!siteUrl) throw new Error('scanSiteForServiceRole needs { siteUrl }')
   const headers = { 'User-Agent': 'airlock-rls (service-role scan)' }
   const findings = []
@@ -262,6 +400,8 @@ export async function scanSiteForServiceRole({ siteUrl, fetchImpl = fetch, maxSc
   scanned++
   const pageFinding = findingFor(scanText(html), siteUrl)
   if (pageFinding) findings.push(pageFinding)
+  let publicKeyFound = hasPublicKey(html)
+  const mapUrls = []
 
   const fetchable = extractScriptUrls(html, siteUrl).filter(isFetchableUrl)
   const scripts = fetchable.slice(0, maxScripts)
@@ -291,7 +431,39 @@ export async function scanSiteForServiceRole({ siteUrl, fetchImpl = fetch, maxSc
     scanned++
     const f = findingFor(scanText(body), url)
     if (f) findings.push(f)
+    if (!publicKeyFound && hasPublicKey(body)) publicKeyFound = true
+    const mapUrl = exposedFiles ? sourceMapUrlFor(body, url) : null
+    if (mapUrl && isFetchableUrl(mapUrl) && !mapUrls.includes(mapUrl)) mapUrls.push(mapUrl)
   }
 
-  return { findings, scanned }
+  if (exposedFiles) {
+    findings.push(...(await probeExposedFiles({ siteUrl, fetchImpl, headers })))
+
+    // Source maps: confirm up to MAX_SOURCE_MAPS by content. A map can also
+    // carry the original source (sourcesContent), so scan it for a key too.
+    const confirmed = []
+    for (const mapUrl of mapUrls.slice(0, MAX_SOURCE_MAPS)) {
+      const body = await fetchOk(fetchImpl, mapUrl, headers)
+      if (body == null || !isSourceMap(body)) continue
+      confirmed.push(mapUrl)
+      const f = findingFor(scanText(body), mapUrl)
+      if (f) findings.push(f)
+    }
+    if (confirmed.length) {
+      const more = mapUrls.length > confirmed.length
+        ? ` (${mapUrls.length} script(s) point to a map; ${confirmed.length} checked)`
+        : ''
+      findings.push({
+        kind: 'source_map_exposed',
+        severity: 'warn',
+        object: confirmed[0],
+        detail:
+          `Source maps are public, so anyone can download your original source code${more}. ` +
+          `Turn them off in the production build or upload them privately to your error tracker.`,
+      })
+    }
+  }
+
+  findings.sort((a, b) => (a.severity === b.severity ? 0 : a.severity === 'fail' ? -1 : 1))
+  return { findings, scanned, publicKeyFound }
 }

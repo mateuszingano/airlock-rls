@@ -207,6 +207,32 @@ It fetches the page and its JS bundles and fails (exit `1`) if a service key is
 present. It **never** flags the `anon` key — that one is public by design — and
 **never** prints the key it finds.
 
+The same run also checks three files a static host should never serve:
+
+- **a downloadable `.env`** (fail) — reports how many variables it holds, never a value;
+- **a public `.git` folder** (fail) — your source and its full history;
+- **public source maps** (warn) — your original source; a service key inside a
+  map's `sourcesContent` is still a fail.
+
+Each one is confirmed by **content**, not by status code: SPA hosts answer `200`
+with `index.html` for any path, and that is never reported.
+
+If the site ships your Supabase **public** key (anon or `sb_publishable_`), the
+report says so: that is normal, but it means RLS is the only lock on your tables,
+and a site scan can't see RLS. Run the DB audit for that.
+
+### Copy-paste fix prompts (`--prompts`)
+
+Add `--prompts` and every problem comes with a prompt to paste into Cursor,
+Lovable, Bolt or Claude Code. It carries the exact table/policy and what Airlock
+found, the change to ask for, and the guard rails an AI tends to skip (never
+"fix" by disabling RLS or by writing `USING (true)`, show the SQL first, re-run
+the check). `--json` always includes it, as `fixPrompt` on each finding.
+
+```bash
+npx airlock-rls "$SUPABASE_DB_URL" --prompts
+```
+
 ---
 
 ## Use it as a GitHub Action (the gate)
@@ -287,7 +313,10 @@ Get the URL from `supabase status` (local) or your project's connection string.
 --anon-key VALUE   Public anon key for the DAST pass ($SUPABASE_ANON_KEY).
 --dast-write       Also probe anonymous INSERTs (safe — leaves no test data).
 --site URL         Deployed site URL — scan its HTML/JS for an exposed
-                   service_role key. Needs no database ($SUPABASE_SITE_URL).
+                   service_role key, plus a downloadable .env, a public .git
+                   and public source maps. Needs no database ($SUPABASE_SITE_URL).
+--prompts          Print a copy-paste fix prompt for each problem (Cursor,
+                   Lovable, Bolt, Claude Code).
 --json             Print the result as JSON instead of a report.
 -h, --help         Show help.
 -v, --version      Show the version.

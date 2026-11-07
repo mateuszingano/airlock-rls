@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.5.1 — 2026-11-07
+
+- **`--prompts`: a copy-paste fix for every problem.** Each finding gets a prompt
+  for Cursor, Lovable, Bolt or Claude Code with the exact object and detail, the
+  change to ask for, and guard rails (never disable RLS or write `USING (true)` to
+  "fix" it, show the SQL first, re-run the check). Without the flag, a failing or
+  warning report ends with a one-line hint. `--json` always carries `fixPrompt`.
+- **`--site` now also checks for a downloadable `.env` (fail), a public `.git`
+  folder (fail) and public source maps (warn).** Each is confirmed by content, so
+  an SPA host answering `200` + `index.html` for every path is never reported. The
+  `.env` finding says how many variables it holds and never echoes a value. A
+  service key inside a source map's `sourcesContent` is a fail like any other.
+- **`--site` notices your Supabase public key** (anon JWT or `sb_publishable_`).
+  Not a finding: the report adds a line that RLS is now the only lock and points
+  at the DB audit. Library callers get `publicKeyFound` on the scan result.
+- Library: `scanSiteForServiceRole` keeps its `{ findings, scanned }` shape and
+  adds `publicKeyFound`; the extra probes can be turned off with
+  `exposedFiles: false`.
+
 ## 0.5.0 — 2026-11-01
 
 Three hardening checks, all **warns** (gate stays the same unless you run

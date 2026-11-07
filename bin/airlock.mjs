@@ -23,6 +23,7 @@ import { audit } from '../src/audit.mjs'
 import { probeAnonReads, probeAnonWrites } from '../src/dast.mjs'
 import { scanSiteForServiceRole } from '../src/service-role.mjs'
 import { fuse, extractTable } from '../src/fuse.mjs'
+import { fixPromptFor } from '../src/fix-prompts.mjs'
 
 const RESET = '\x1b[0m'
 const RED = '\x1b[31m'
@@ -53,12 +54,17 @@ Options:
   --url URL          Supabase project URL — enables the DAST pass ($SUPABASE_URL).
   --anon-key VALUE   Public anon credential for the DAST pass. Env: SUPABASE_ANON_KEY.
   --site URL         Deployed site URL — scans its HTML/JS for an exposed
-                     service_role key. Needs no database. Env: SUPABASE_SITE_URL.
+                     service_role key, plus a downloadable .env, a public .git
+                     folder and public source maps. Needs no database.
+                     Env: SUPABASE_SITE_URL.
   --max-scripts <n>  How many JS bundles the --site scan reads (default: 50).
                      If a site has more, a scan_truncated warning names how many
                      went unscanned rather than implying it looked at them all.
   --dast-write       Also probe anonymous INSERTs (safe: an empty payload fails a
                      column constraint, revealing RLS passed without persisting).
+  --prompts          After the report, print a copy-paste fix prompt for each
+                     problem, ready for Cursor, Lovable, Bolt or Claude Code.
+                     (--json always includes them, as "fixPrompt".)
   --json             Print the result as JSON instead of a report.
   -h, --help         Show this help.
   -v, --version      Show the version.
@@ -84,6 +90,9 @@ function parseArgs(argv) {
         break
       case '--json':
         opts.json = true
+        break
+      case '--prompts':
+        opts.prompts = true
         break
       case '--fail-on':
         opts.failOn = argv[++i]
@@ -164,7 +173,7 @@ async function readVersion() {
   }
 }
 
-function report(result, { dbAudited = true } = {}) {
+function report(result, { dbAudited = true, prompts = false } = {}) {
   const fails = result.findings.filter((f) => f.severity === 'fail')
   const warns = result.findings.filter((f) => f.severity === 'warn')
 
@@ -176,7 +185,7 @@ function report(result, { dbAudited = true } = {}) {
     // schema is clean; say what was actually looked at.
     if (dbAudited) console.log(`${GREEN}✓ No RLS problems in "${result.schema}".${RESET}`)
     if (result.siteScan) {
-      console.log(`${GREEN}✓ No service key exposed on ${result.siteScan.url} (${result.siteScan.scanned} file(s) scanned).${RESET}`)
+      console.log(`${GREEN}✓ No service key, .env, .git or source map exposed on ${result.siteScan.url} (${result.siteScan.scanned} file(s) scanned).${RESET}`)
     }
   }
 
@@ -193,6 +202,16 @@ function report(result, { dbAudited = true } = {}) {
     )
   }
 
+  // The site ships a Supabase public key: normal, but it means RLS is the only
+  // lock on the tables, and a site scan can't see RLS. Point at the audit that can.
+  if (!dbAudited && result.siteScan?.publicKeyFound) {
+    console.log(
+      `${DIM}ℹ This site ships your Supabase public (anon/publishable) key. That's normal, but it means Row Level\n` +
+        `  Security is the only thing protecting your tables, and a site scan can't see it. Audit the policies too:\n` +
+        `    npx airlock-rls "postgresql://..."   (Supabase dashboard → Connect → connection string)${RESET}`
+    )
+  }
+
   if (result.gatePassed) {
     const tail = warns.length ? ` ${DIM}(${warns.length} warning(s))${RESET}` : ''
     console.log(`\n${GREEN}${dbAudited ? 'RLS audit' : 'Site scan'} passed.${RESET}${tail}`)
@@ -205,6 +224,17 @@ function report(result, { dbAudited = true } = {}) {
   } else {
     const what = result.problems ? `${result.problems} problem(s) found` : `${warns.length} warning(s) with --fail-on warn`
     console.log(`\n${RED}${dbAudited ? 'RLS audit' : 'Site scan'} failed: ${what}.${RESET}`)
+  }
+
+  const withPrompt = result.findings.filter((f) => f.fixPrompt)
+  if (prompts && withPrompt.length) {
+    console.log(`\n${DIM}── Fix prompts: paste one at a time into your AI tool (Cursor, Lovable, Bolt, Claude Code) ──${RESET}`)
+    withPrompt.forEach((f, i) => {
+      console.log(`\n[${i + 1}/${withPrompt.length}] ${f.object}`)
+      console.log(f.fixPrompt)
+    })
+  } else if (!prompts && withPrompt.length) {
+    console.log(`${DIM}  Run again with --prompts for a copy-paste fix for each problem (Cursor, Lovable, Bolt, Claude Code).${RESET}`)
   }
 }
 
@@ -275,8 +305,8 @@ async function main() {
       // scanned. Still exits 2: never a false pass.
       throw new Error(`Couldn't scan ${opts.site}: ${err.cause?.code || err.message}`)
     }
-    const { findings, scanned } = scan
-    result.siteScan = { scanned, url: opts.site }
+    const { findings, scanned, publicKeyFound } = scan
+    result.siteScan = { scanned, url: opts.site, publicKeyFound: Boolean(publicKeyFound) }
     if (findings.length) {
       result.findings.push(...findings)
       result.findings.sort((a, b) => (a.severity === b.severity ? 0 : a.severity === 'fail' ? -1 : 1))
@@ -291,11 +321,18 @@ async function main() {
   // here, after every pass (static + DAST + site scan) has contributed findings.
   result.gatePassed = opts.failOn === 'warn' ? result.problems === 0 && result.warnings === 0 : result.passed
 
+  // Attach a copy-paste fix prompt to every finding that has one (additive
+  // field; findings without a fix, like config bookkeeping, get none).
+  for (const f of result.findings) {
+    const prompt = fixPromptFor(f)
+    if (prompt) f.fixPrompt = prompt
+  }
+
   if (opts.json) {
     console.log(JSON.stringify(result, null, 2))
   } else {
     if (result.dast) console.log(`${DIM}(DAST: probed ${result.dast.probed} table(s) with the anon key)${RESET}`)
-    report(result, { dbAudited: Boolean(opts.dbUrl) })
+    report(result, { dbAudited: Boolean(opts.dbUrl), prompts: Boolean(opts.prompts) })
   }
 
   return result.gatePassed ? 0 : 1
