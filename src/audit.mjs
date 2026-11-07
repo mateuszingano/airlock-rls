@@ -664,6 +664,7 @@ export function buildResult({
   realtimeTables = [],
   bypassRoles = [],
   tableOwners = [],
+  defaultAcls = [],
   grants = null,
   clientRoles = null,
   allow = new Set(),
@@ -947,6 +948,57 @@ export function buildResult({
     }
   }
 
+  // DEFAULT PRIVILEGES that hand future tables to the API roles. Since Supabase's
+  // Oct 30 2026 change, a new table in `public` is no longer granted to anon /
+  // authenticated automatically, and calls to it answer 42501. The quick way to
+  // silence that is `ALTER DEFAULT PRIVILEGES ... GRANT ALL ON TABLES TO anon,
+  // authenticated` (or a one-off `GRANT ALL ON ALL TABLES ...`). The one-off
+  // grant leaves no trace beyond the grants themselves, which the per-table
+  // rules already judge (RLS off → rls_disabled; RLS on with no policy → deny).
+  // The DEFAULT form is the latent one: every table created later by that role
+  // is born readable/writable by the API, and if a migration forgets
+  // `enable row level security`, it ships open. Hence a warn: nothing leaks
+  // today because of it, but it removes the safety net for tomorrow's table.
+  // Defaults owned by Supabase-managed roles (supabase_admin, supabase_*, pg_*)
+  // are the platform's own and cannot be changed by `postgres` — skipped.
+  {
+    const API = new Set(['anon', 'authenticated', 'public'])
+    const groups = new Map() // owner|scope → { owner, scope, byGrantee: Map<grantee, Set<priv>> }
+    for (const d of defaultAcls) {
+      const grantee = String(d.grantee || '').toLowerCase()
+      if (!API.has(grantee)) continue
+      const owner = String(d.owner || '')
+      if (!owner || isManagedRole(owner) && owner.toLowerCase() !== 'postgres') continue
+      const scope = d.nspname ? String(d.nspname) : '*'
+      const key = `${owner}|${scope}`
+      const g = groups.get(key) || { owner, scope, byGrantee: new Map() }
+      groups.set(key, g)
+      const set = g.byGrantee.get(grantee) || new Set()
+      set.add(String(d.privilege_type).toUpperCase())
+      g.byGrantee.set(grantee, set)
+    }
+    const WRITE = ['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE']
+    for (const g of groups.values()) {
+      const parts = [...g.byGrantee].map(([who, privs]) => `${who === 'public' ? 'PUBLIC' : who}: ${[...privs].sort().join(', ')}`)
+      const writes = [...g.byGrantee.values()].some((privs) => WRITE.some((w) => privs.has(w)))
+      const where = g.scope === '*' ? 'in every schema' : `in schema "${g.scope}"`
+      const f = {
+        kind: 'default_privileges_to_api_roles',
+        severity: 'warn',
+        object: `defaults:${g.owner}`,
+        detail:
+          `default privileges make every table "${g.owner}" creates ${where} ${writes ? 'readable AND writable' : 'readable'} by the API (${parts.join('; ')}). ` +
+          `Nothing is exposed by this alone today, but a future table whose migration forgets ENABLE ROW LEVEL SECURITY ships open. ` +
+          `This is the usual footprint of silencing the post-Oct-30 42501 errors with a blanket grant. Grant each new table explicitly instead.`,
+      }
+      if (nsAllowed(allowSet, usedAllow, 'defaults', g.owner)) allowed.push(f)
+      else {
+        noteBare('defaults', g.owner)
+        findings.push(f)
+      }
+    }
+  }
+
   // A bare name that would have silenced a non-policy object no longer does.
   // Say so with the exact spelling to use, instead of leaving the author to
   // believe the finding was waived.
@@ -980,6 +1032,7 @@ export function buildResult({
   for (const t of realtimeTables) existingTargets.add(`realtime:${t.tablename || t}`)
   for (const role of bypassRoles) if (ownerIsClientReachable(role.rolname) || !isManagedRole(role.rolname)) existingTargets.add(`role:${role.rolname}`)
   for (const t of tableOwners) existingTargets.add(`table:${t.tablename}`)
+  for (const d of defaultAcls) if (d.owner) existingTargets.add(`defaults:${d.owner}`)
 
   // An --allow entry that names nothing at all is a stale waiver: the object was
   // renamed or dropped, and the entry now protects nothing while reading like it
@@ -1289,7 +1342,27 @@ export async function audit({ dbUrl, schema = 'public', allow = [] } = {}) {
       )
       return rows
     })
-    return buildResult({ schema, noRls, policies, allTables, publicBuckets, secDefFns, views, matviews, storagePolicies, realtimeTables, bypassRoles, tableOwners, grants, clientRoles, allow, skipped })
+    // Default privileges on TABLES that grant to the API roles, for the audited
+    // schema or for every schema (defaclnamespace = 0). aclexplode grantee 0 is
+    // PUBLIC. Optional: a restricted audit role may not read pg_default_acl.
+    const defaultAcls = await optional('default privileges', async () => {
+      const { rows } = await client.query(
+        `select pg_get_userbyid(d.defaclrole) as owner,
+                n.nspname,
+                case when a.grantee = 0 then 'public' else pg_get_userbyid(a.grantee) end as grantee,
+                a.privilege_type
+           from pg_catalog.pg_default_acl d
+           left join pg_catalog.pg_namespace n on n.oid = d.defaclnamespace
+           cross join lateral aclexplode(d.defaclacl) a
+          where d.defaclobjtype = 'r'
+            and (n.nspname = $1 or d.defaclnamespace = 0)
+            and (a.grantee = 0 or pg_get_userbyid(a.grantee) in ('anon', 'authenticated'))
+          order by 1, 2, 3, 4`,
+        [schema]
+      )
+      return rows
+    })
+    return buildResult({ schema, noRls, policies, allTables, publicBuckets, secDefFns, views, matviews, storagePolicies, realtimeTables, bypassRoles, tableOwners, defaultAcls, grants, clientRoles, allow, skipped })
   } finally {
     await client.end()
   }
