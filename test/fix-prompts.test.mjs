@@ -8,7 +8,7 @@ test('every rule that reports a real exposure has a fix prompt', () => {
     'write_unscoped', 'write_unchecked', 'update_using_unscoped', 'delete_unscoped', 'anon_read_leak',
     'anon_write_leak', 'security_definer', 'anon_executes_definer', 'definer_search_path_mutable',
     'view_bypasses_rls', 'matview_exposed', 'public_bucket', 'realtime_exposure', 'bypassrls_role',
-    'owner_bypasses_rls', 'default_privileges_to_api_roles', 'service_role_exposed', 'env_file_exposed', 'git_exposed', 'source_map_exposed',
+    'owner_bypasses_rls', 'default_privileges_to_api_roles', 'policy_trusts_user_metadata', 'service_role_exposed', 'env_file_exposed', 'git_exposed', 'source_map_exposed',
   ]) assert.ok(PROMPT_KINDS.includes(k), `missing prompt for ${k}`)
 })
 
