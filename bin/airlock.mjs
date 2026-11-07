@@ -24,6 +24,7 @@ import { probeAnonReads, probeAnonWrites } from '../src/dast.mjs'
 import { scanSiteForServiceRole } from '../src/service-role.mjs'
 import { fuse, extractTable } from '../src/fuse.mjs'
 import { fixPromptFor } from '../src/fix-prompts.mjs'
+import { emitGithubOutputs } from '../src/sarif.mjs'
 
 const RESET = '\x1b[0m'
 const RED = '\x1b[31m'
@@ -65,6 +66,9 @@ Options:
   --prompts          After the report, print a copy-paste fix prompt for each
                      problem, ready for Cursor, Lovable, Bolt or Claude Code.
                      (--json always includes them, as "fixPrompt".)
+  --sarif <file>     Also write a SARIF 2.1.0 log (for GitHub code scanning via
+                     github/codeql-action/upload-sarif). The report still prints.
+  --format github    Also print ::error/::warning annotations for GitHub Actions.
   --json             Print the result as JSON instead of a report.
   -h, --help         Show this help.
   -v, --version      Show the version.
@@ -93,6 +97,12 @@ function parseArgs(argv) {
         break
       case '--prompts':
         opts.prompts = true
+        break
+      case '--sarif':
+        opts.sarif = argv[++i] ?? ''
+        break
+      case '--format':
+        opts.format = argv[++i]
         break
       case '--fail-on':
         opts.failOn = argv[++i]
@@ -128,6 +138,8 @@ function parseArgs(argv) {
         else if (a.startsWith('--url=')) opts.url = a.slice('--url='.length)
         else if (a.startsWith('--anon-key=')) opts.anonKey = a.slice('--anon-key='.length)
         else if (a.startsWith('--site=')) opts.site = a.slice('--site='.length)
+        else if (a.startsWith('--sarif=')) opts.sarif = a.slice('--sarif='.length)
+        else if (a.startsWith('--format=')) opts.format = a.slice('--format='.length)
         else if (a.startsWith('--max-scripts=')) opts.maxScripts = parseMaxScripts(a.slice('--max-scripts='.length))
         else if (a.startsWith('-')) throw new UsageError(`Unknown option: ${a}`)
         else positional.push(a)
@@ -142,6 +154,11 @@ function parseArgs(argv) {
   opts.failOn = (opts.failOn || process.env.RLS_AUDIT_FAIL_ON || 'fail').toLowerCase()
   if (opts.failOn !== 'fail' && opts.failOn !== 'warn') {
     throw new UsageError(`Invalid --fail-on "${opts.failOn}". Use "fail" (default) or "warn".`)
+  }
+  if (opts.sarif !== undefined && !opts.sarif) throw new UsageError('--sarif needs a file path.')
+  opts.format = opts.format || process.env.AIRLOCK_FORMAT || 'text'
+  if (opts.format !== 'text' && opts.format !== 'github') {
+    throw new UsageError(`Invalid --format "${opts.format}". Use "text" (default) or "github".`)
   }
   return opts
 }
@@ -327,6 +344,9 @@ async function main() {
     const prompt = fixPromptFor(f)
     if (prompt) f.fixPrompt = prompt
   }
+
+  // GitHub-native outputs (SARIF file, workflow annotations) — additive to the report.
+  emitGithubOutputs(result, { sarif: opts.sarif, format: opts.format, json: opts.json })
 
   if (opts.json) {
     console.log(JSON.stringify(result, null, 2))

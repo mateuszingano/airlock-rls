@@ -39,6 +39,10 @@ inputs:
     description: 'Also probe anonymous INSERTs during the DAST pass (safe — leaves no test data). Set to "true" to enable.'
     required: false
     default: 'false'
+  sarif:
+    description: 'Optional path to also write a SARIF 2.1.0 log (e.g. "airlock.sarif"). Upload it with github/codeql-action/upload-sarif (if: always(), since the gate fails the step on a leak). The normal report and exit code are unchanged.'
+    required: false
+    default: ''
   node-version:
     description: 'Node.js version used to run the audit.'
     required: false
@@ -69,8 +73,10 @@ runs:
         node "$GITHUB_ACTION_PATH/bin/airlock.mjs"
         --schema "$INPUT_SCHEMA"
         $DAST_WRITE_FLAG
+        ${INPUT_SARIF:+--sarif "$INPUT_SARIF"}
       env:
         INPUT_SCHEMA: ${{ inputs.schema }}
+        INPUT_SARIF: ${{ inputs.sarif }}
         RLS_AUDIT_FAIL_ON: ${{ inputs.fail-on }}
         DAST_WRITE_FLAG: ${{ inputs.dast-write == 'true' && '--dast-write' || '' }}
         SUPABASE_DB_URL: ${{ inputs.db-url }}
