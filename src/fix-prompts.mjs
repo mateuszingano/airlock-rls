@@ -78,6 +78,12 @@ const ASK = {
   owner_bypasses_rls:
     'The table owner bypasses RLS on this table. If anything client-facing connects as the owner, enable ' +
     'ALTER TABLE ... FORCE ROW LEVEL SECURITY, or switch that connection to a non-owner role.',
+  policy_trusts_user_metadata:
+    'This check reads user_metadata (auth.jwt() -> \'user_metadata\' or auth.users.raw_user_meta_data), which any ' +
+    'signed-in user can change for themselves with supabase.auth.updateUser({ data: ... }), so anyone can pass it. ' +
+    'Move the role or tenant id to app_metadata (only the server / service role can write it, read it with ' +
+    'auth.jwt() -> \'app_metadata\') or to a table users cannot write (e.g. a memberships table with its own RLS), ' +
+    'update the policy or function to read it from there, and make sure nothing lets users write that value.',
   service_role_exposed:
     'My Supabase service key (service_role / sb_secret) is in the JavaScript that ships to the browser. It bypasses ' +
     'all Row Level Security. Move every use of it to server-side code (API route, server action or Edge Function), ' +

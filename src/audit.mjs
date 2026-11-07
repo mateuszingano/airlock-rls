@@ -10,6 +10,7 @@
 //   - anon_unscoped         anon can read rows without scoping to a user      [fail]
 //   - authenticated_unscoped any logged-in user reads all rows (no auth.uid) [warn]
 //   - write_unchecked       INSERT/UPDATE/ALL with no WITH CHECK guard        [warn]
+//   - policy_trusts_user_metadata  access decided by user-editable metadata  [fail]
 //
 // audit() returns a structured result; it never prints or exits — callers
 // decide how to report. `pg` is loaded lazily so the pure classifier
@@ -37,6 +38,7 @@ import {
   helperCallQual,
   hasUnprovenOrBranch as coreHasUnprovenOrBranch,
 } from './scope.mjs'
+import { trustsUserMetadata, bodyTrustsUserMetadata } from './user-metadata.mjs'
 
 // ── Qualifier predicates ────────────────────────────────────────────────────
 // These used to reason about the qualifier with regexes (paren counting, `or`
@@ -635,6 +637,57 @@ export function classifyPolicy(p, ctx = {}) {
   return out
 }
 
+/**
+ * A policy that decides access from `user_metadata` (the JWT claim) or
+ * `auth.users.raw_user_meta_data`. Every signed-in user can rewrite their own
+ * user_metadata from the browser (`supabase.auth.updateUser({ data })`), so the
+ * check is satisfiable by anyone who signs up: an admin gate they can open, or a
+ * tenant id they can set to someone else's. The scope engine sees the caller
+ * token compared to a row column and calls it scoped, so without this rule
+ * `org_id = (auth.jwt()->'user_metadata'->>'org_id')::uuid` passed green.
+ *
+ * Severity follows the engine's rule for "provably satisfiable by any
+ * authenticated user": FAIL on a permissive policy (like a literal-true for
+ * `authenticated`), downgraded to warn only when a restrictive policy that does
+ * NOT itself trust user_metadata scopes every command. A RESTRICTIVE policy that
+ * trusts it is a warn: the narrowing it was meant to add can be bypassed, but
+ * the permissive policies still gate access. Policies only `TO anon` never fire:
+ * an anon token carries no user_metadata to edit. `app_metadata` (server-only)
+ * never fires.
+ *
+ * @param {object} p     policy row (tablename, policyname, cmd, roles[], qual, with_check, permissive)
+ * @param {object} [ctx] { grants, restrictives, clientRoles } as for classifyPolicy
+ * @returns {Finding[]}
+ */
+export function classifyUserMetadata(p, ctx = {}) {
+  const { grants = null, restrictives = [], clientRoles = null } = ctx
+  const where = trustsUserMetadata(p.qual) || trustsUserMetadata(p.with_check)
+  if (!where) return []
+  if (!includesAuthenticated(p.roles, clientRoles?.authenticated || null)) return []
+  const cmds = commandsOf(p.cmd)
+  if (!cmds.some((c) => hasGrant(grants, 'authenticated', c))) return []
+  const cmd = normCmd(p.cmd)
+  const object = `${p.tablename}."${p.policyname}"`
+  const how = `decides access from ${where}, which any signed-in user can set for themselves with supabase.auth.updateUser({ data: … })`
+  if (isRestrictive(p)) {
+    return [{
+      kind: 'policy_trusts_user_metadata',
+      severity: 'warn',
+      object,
+      detail: `[${cmd}] RESTRICTIVE policy ${how} — the restriction it adds can be bypassed. Keep roles and tenant ids in app_metadata (server-only) or a table users can't write.`,
+    }]
+  }
+  // Only a restrictive that does not lean on user_metadata itself can narrow this.
+  const honest = restrictives.filter((r) => !trustsUserMetadata(r.qual) && !trustsUserMetadata(r.with_check))
+  const saved = restrictiveScopesEvery(honest, cmds, 'authenticated', 'using')
+  return [{
+    kind: 'policy_trusts_user_metadata',
+    severity: saved ? 'warn' : 'fail',
+    object,
+    detail: `[${cmd}] policy ${how} — so anyone who signs up passes it (grant themselves a role, or put another tenant's id in their own metadata). Use app_metadata (server-only) or a table users can't write${saved ? ' (a restrictive policy narrows it — verify)' : ''}.`,
+  }]
+}
+
 function short(s, n = 60) {
   s = String(s).replace(/\s+/g, ' ').trim()
   return s.length > n ? s.slice(0, n - 1) + '…' : s
@@ -754,7 +807,7 @@ export function buildResult({
   const allowed = []
   for (const p of policies) {
     const ctx = { grants: grantsFor(p.tablename), restrictives: restrictivesByTable[p.tablename] || [], clientRoles }
-    for (const f of classifyPolicy(p, ctx)) {
+    for (const f of [...classifyPolicy(p, ctx), ...classifyUserMetadata(p, ctx)]) {
       const hit = policyAllowed(allowSet, p, tablesByPolicyName)
       if (hit) {
         usedAllow.add(hit)
@@ -834,10 +887,28 @@ export function buildResult({
       if (nsAllowed(allowSet, usedAllow, 'fn', fn.proname)) allowed.push(sf)
       else findings.push(sf) // noteBare already recorded above for this fn
     }
+    // A client-callable definer body that reads user-editable metadata. Typical
+    // shape: an is_admin() helper used inside policies that checks
+    // raw_user_meta_data->>'role'. A body is plpgsql we can't parse into a
+    // decision, so this is a warn ("verify"), not a fail. Only when prosrc was
+    // queried (back-compat for callers that don't pass it).
+    const bodyWhere = (anonExec || authExec) && fn.prosrc !== undefined ? bodyTrustsUserMetadata(fn.prosrc) : null
+    if (bodyWhere) {
+      const uf = {
+        kind: 'policy_trusts_user_metadata',
+        severity: 'warn',
+        object: `fn:${fn.proname}`,
+        detail: `SECURITY DEFINER function that ${anonExec ? 'anon' : 'any authenticated user'} can EXECUTE reads ${bodyWhere}, which any signed-in user can set for themselves with supabase.auth.updateUser({ data: … }). If it decides a role or tenant (e.g. an is_admin() helper used in policies), anyone can pass it — read app_metadata (server-only) or a table users can't write.`,
+      }
+      if (nsAllowed(allowSet, usedAllow, 'fn', fn.proname)) allowed.push(uf)
+      else findings.push(uf)
+    }
   }
   // Storage object-level policies (storage.objects) — same logic, prefixed.
   for (const p of storagePolicies) {
-    for (const f of classifyPolicy({ ...p, tablename: 'storage.objects' }, { grants: null, restrictives: [], clientRoles })) {
+    const sp = { ...p, tablename: 'storage.objects' }
+    const sctx = { grants: null, restrictives: [], clientRoles }
+    for (const f of [...classifyPolicy(sp, sctx), ...classifyUserMetadata(sp, sctx)]) {
       const hit = policyAllowed(allowSet, { ...p, tablename: 'storage.objects' }, tablesByPolicyName)
       if (hit) {
         usedAllow.add(hit)
@@ -1190,6 +1261,7 @@ export async function audit({ dbUrl, schema = 'public', allow = [] } = {}) {
     const { rows: secDefFns } = await client.query(
       `select p.proname,
               p.proconfig,
+              p.prosrc,
               coalesce(to_regrole('anon') is not null and has_function_privilege('anon', p.oid, 'EXECUTE'), false) as anon_exec,
               coalesce(to_regrole('authenticated') is not null and has_function_privilege('authenticated', p.oid, 'EXECUTE'), false) as auth_exec
          from pg_proc p join pg_namespace n on n.oid = p.pronamespace
