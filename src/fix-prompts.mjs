@@ -78,6 +78,12 @@ const ASK = {
   owner_bypasses_rls:
     'The table owner bypasses RLS on this table. If anything client-facing connects as the owner, enable ' +
     'ALTER TABLE ... FORCE ROW LEVEL SECURITY, or switch that connection to a non-owner role.',
+  default_privileges_to_api_roles:
+    'Default privileges in my database make every new table readable/writable by the anon and authenticated roles, ' +
+    'probably added to silence 42501 errors after Supabase stopped auto-granting new tables. Write a migration that ' +
+    'revokes these default privileges (ALTER DEFAULT PRIVILEGES FOR ROLE <owner> IN SCHEMA <schema> REVOKE ... ON ' +
+    'TABLES FROM anon, authenticated), and from now on grant each new table explicitly, only the commands its RLS ' +
+    'policies allow, right after ENABLE ROW LEVEL SECURITY. Do not revoke grants that existing tables need.',
   service_role_exposed:
     'My Supabase service key (service_role / sb_secret) is in the JavaScript that ships to the browser. It bypasses ' +
     'all Row Level Security. Move every use of it to server-side code (API route, server action or Edge Function), ' +

@@ -142,3 +142,17 @@ test('hardening: mutable search_path, a custom BYPASSRLS role and a client-owned
   assert.ok(has('owner_bypasses_rls', 'table:owned_by_authed'),
     `expected owner_bypasses_rls on owned_by_authed, got: ${JSON.stringify(result.findings)}`)
 })
+
+test('lazy grant: postgres default privileges to anon/authenticated warn; supabase_admin defaults do not', gate, async () => {
+  await loadFixture('lazy-grant.sql')
+  const result = await audit({ dbUrl: DB_URL, schema: 'lazygrant' })
+  const lazy = result.findings.filter((f) => f.kind === 'default_privileges_to_api_roles')
+  assert.equal(lazy.length, 1, `expected exactly one default-privileges warn, got: ${JSON.stringify(lazy)}`)
+  assert.equal(lazy[0].object, 'defaults:postgres')
+  assert.equal(lazy[0].severity, 'warn')
+  assert.match(lazy[0].detail, /readable AND writable/)
+  assert.ok(!result.findings.some((f) => f.object === 'defaults:supabase_admin'), 'supabase_admin defaults are the platform\'s, never flagged')
+  const clean = await audit({ dbUrl: DB_URL, schema: 'lazyclean' })
+  assert.ok(!clean.findings.some((f) => f.kind === 'default_privileges_to_api_roles'),
+    `a schema without such defaults must stay silent, got: ${JSON.stringify(clean.findings)}`)
+})
