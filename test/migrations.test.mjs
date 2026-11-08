@@ -206,3 +206,14 @@ test('#migrations CLI: exit 1 with file:line in the report, exit 0 on clean, exi
   assert.match(misuse.stderr, /can't be used with "migrations"/)
   assert.equal(run('postgresql://localhost:1/x', '--no-default-grants').status, 2)
 })
+
+test('#migrations the emulated legacy auto-grant is never reported, but a lazy-fix migration is', async () => {
+  // The emulation itself is default privileges: it must not trip
+  // default_privileges_to_api_roles on a clean folder (checked above), while a
+  // migration that widens the defaults is the user's and must be flagged.
+  for (const defaultGrants of [true, false]) {
+    const r = await auditMigrations({ paths: [FIX('migrations-lazy')], defaultGrants })
+    const kinds = r.findings.map((f) => f.kind)
+    assert.ok(kinds.includes('default_privileges_to_api_roles'), `defaultGrants=${defaultGrants}: ${kinds}`)
+  }
+})

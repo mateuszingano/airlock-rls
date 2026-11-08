@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.6.0 — 2026-11-07
+
+- **`airlock migrations`: audit without a database.** Replays your SQL migrations
+  (default `supabase/migrations`, file-name order) into an embedded Postgres
+  (PGlite) after recreating what a hosted Supabase project has (API roles, auth
+  helpers and `auth.users`, storage tables, realtime publication, default grants
+  on `public`), then runs the same audit engine, unchanged. Findings get `file`
+  and `line` of the migration that created the object. Statements that fail to
+  load are listed and raise a `migrations_incomplete` warning; nothing loadable is
+  exit 2. Unsupported `CREATE EXTENSION` is skipped and counted.
+  `--no-default-grants` models projects created after Oct 30, 2026.
+- The embedded Postgres is downloaded on first use of `airlock migrations` (~27 MB, once, into
+  `~/.cache/airlock-rls/`), not installed with the package, so `npx airlock-rls` stays small.
+- **New rule `policy_trusts_user_metadata` (fail).** A policy that decides access
+  from `user_metadata` (`auth.jwt() -> 'user_metadata'`, the path form, or
+  `auth.users.raw_user_meta_data`) is satisfiable by any user, who can edit their
+  own metadata with `auth.updateUser()`. The tenant shape
+  `org_id = (auth.jwt()->'user_metadata'->>'org_id')::uuid` passed green before.
+  Restrictive policies and client-callable SECURITY DEFINER bodies that read it
+  are warns. `app_metadata` never fires. Fix prompt included (`--prompts`).
+- **`default_privileges_to_api_roles`** (warn): default privileges on tables
+  that grant to `anon` / `authenticated` / `PUBLIC`, in the audited schema or in
+  every schema — the latent footprint of silencing the post-Oct-30 42501 errors.
+  Reads `pg_default_acl` (optional check: a role that cannot read it gets
+  `check_skipped`). Supabase-managed owners are skipped. Waive with
+  `defaults:<owner>`. Fix prompt included.
+- **`--fix-sql <file>`: a draft fix migration.** Real SQL for the fixes whose
+  effect is fully determined by the finding (enable RLS, revoke a grant, pin a
+  search_path, `security_invoker` on a view, make a bucket private, `FORCE ROW
+  LEVEL SECURITY`), each with a note on what it can break; commented TODO
+  templates for anything that needs a decision. Policies are never rewritten
+  automatically. Proven by a round-trip test on a real Postgres with hostile
+  identifiers: the draft applies cleanly and every mechanical finding is gone.
+- **`--sarif <file>` and `--format github`.** A SARIF 2.1.0 log (validated against the official
+  schema) for GitHub code scanning, and `::error`/`::warning` annotations. Findings with a
+  migration `file`/`line` get a physical location; database findings a logical one. Additive:
+  the report and exit codes are unchanged. The Action gains a `sarif` input.
+- **Agent skill** in `skills/airlock-rls/` (install with `npx skills add
+  https://github.com/mateuszingano/airlock-rls --skill airlock-rls`). Not part of the npm package.
+
 ## 0.5.1 — 2026-11-07
 
 - **`--prompts`: a copy-paste fix for every problem.** Each finding gets a prompt

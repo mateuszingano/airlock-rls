@@ -15,12 +15,14 @@ with `--json` so you can read the findings, and use `npx -y airlock-rls@latest`.
 | What you have | Command | Needs |
 |---|---|---|
 | Only the deployed URL | `npx -y airlock-rls@latest --site https://app.example.com --json` | Nothing else. Reads the page, its JS bundles, `/.env`, `/.git/HEAD` and source maps. |
+| The repo, with `supabase/migrations/` (no DB access) | `npx -y airlock-rls@latest migrations --json` (or `migrations <path>`) | Nothing secret. Replays the SQL into an embedded Postgres (first run downloads ~27 MB once) and runs the same audit; findings carry `file` and `line`. Can't see grants made by hand in the dashboard: say so. |
 | The database connection string | `npx -y airlock-rls@latest --json` (reads `$SUPABASE_DB_URL`) | Postgres URL: Supabase dashboard, Connect, connection string. |
 | DB URL + project URL + anon key | add `--url "$SUPABASE_URL" --anon-key "$SUPABASE_ANON_KEY"` | Also runs DAST: actually reads each table with the anon key and proves anonymous leaks. |
 | Both site and DB | combine `--site <url>` with the DB run | |
 
-Start with `--site` when the user only gave a URL. Offer the DB audit for everything RLS:
-a site scan cannot see policies.
+Start with `--site` when the user only gave a URL. In a repo that has `supabase/migrations/`,
+start with the `migrations` mode: it needs no credentials. Offer the live DB audit for the
+deployed database: a site scan cannot see policies, and migrations can drift from production.
 
 **The connection string is a secret.** Never print it, echo it, paste it into a command
 line that will be shown, or write it to a file in the repo. Read it from the environment
@@ -31,7 +33,9 @@ the CLI does not need it.
 Other options that exist (don't invent more; run `npx -y airlock-rls@latest --help` if unsure):
 `--schema <name>` (default `public`), `--allow <names>`, `--fail-on fail|warn`, `--strict`
 (= `--fail-on warn`), `--dast-write`, `--max-scripts <n>`, `--prompts` (human-readable fix
-prompts; `--json` already includes them).
+prompts; `--json` already includes them), `--fix-sql <file>` (a draft migration: real SQL for
+mechanical fixes, TODO templates for the rest; review it with the user before applying),
+`--sarif <file>`, `--format github`, `--no-default-grants` (migrations mode).
 
 ## 2. Read the result
 

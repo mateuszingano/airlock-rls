@@ -34,6 +34,61 @@ RLS audit failed: 3 problem(s) found.
 
 Exit code `1`, so the same command blocks a merge in CI ([GitHub Action below](#use-it-as-a-github-action-the-gate)).
 
+## No database? Audit your migrations
+
+```bash
+npx airlock-rls migrations                 # reads ./supabase/migrations
+npx airlock-rls migrations schema.sql      # or any files / folders
+```
+
+No connection string, no credentials, nothing leaves your machine. Airlock
+replays your SQL migrations (in file-name order, like the Supabase CLI) into an
+embedded Postgres ([PGlite](https://pglite.dev)) and runs **the same audit** as
+the live mode: every rule, the grant-aware logic, `--allow`, `--fail-on`,
+`--json`, `--prompts`. Each finding it can trace says which migration and line
+created the object:
+
+```
+(migrations: 2 file(s), 12 of 16 statement(s) loaded into an embedded Postgres, 1 failed, 1 extension(s) skipped (pg_net))
+✗ 2 problem(s) in "public":
+    ✗ profiles table in "public" has RLS DISABLED — every row is exposed to the API roles (supabase/migrations/20260101000000_init.sql:9)
+    ✗ notes."read all" [SELECT] USING(true) — anon reads every row (supabase/migrations/20260101000000_init.sql:22)
+```
+
+Before your first migration it recreates what a hosted project already has: the
+`anon`/`authenticated`/`service_role`/`authenticator` roles, `auth.uid()`,
+`auth.role()`, `auth.jwt()` and `auth.users`, `storage.buckets`/`objects` (RLS
+on), the `extensions` schema, the `supabase_realtime` publication, and stubs for
+`cron.schedule`. Common extensions load (`uuid-ossp`, `pgcrypto`, `pg_trgm`,
+`citext`, `hstore`, `ltree`, `moddatetime`, `unaccent`, `fuzzystrmatch`,
+`btree_gist`, `btree_gin`, and `vector` when available); others (`pg_net`,
+`pg_graphql`, `pgsodium`…) are skipped and counted.
+
+**Default grants.** Projects created before Oct 30, 2026 auto-grant new tables in
+`public` to `anon`/`authenticated`, and most migrations rely on it (they never
+`GRANT`). The migrations mode emulates that by default, because a security tool
+should assume the grant. `--no-default-grants` models a newer project: an
+ungranted `USING (true)` table is then not reported as exposed.
+
+**Honest about what it couldn't load.** A statement that fails is listed with its
+file, line and error, and the run adds a `migrations_incomplete` warning:
+whatever it would have created was not audited. If nothing loads at all, the
+exit code is `2`, never a clean pass. `BEGIN`/`COMMIT` are skipped so one bad
+statement can't hide the rest of its file.
+
+**Live vs. migrations.** The live mode reads the real catalog (including grants
+made by hand in the dashboard and drift from what the migrations say) and can
+prove leaks with DAST. Use migrations in CI on every PR; use the live mode (or
+Airlock Monitor) on the deployed database. `--url`, `--anon-key`,
+`--dast-write` and `--site` are refused in migrations mode.
+
+The embedded Postgres (~27 MB) is **not** a dependency of `airlock-rls`, so a plain
+`npx airlock-rls` stays small. The first `airlock migrations` run downloads it once into
+`~/.cache/airlock-rls/` (override with `$AIRLOCK_CACHE_DIR`); later runs start in about two seconds.
+
+
+---
+
 ## How it works
 
 1. **Reads the catalog** — `pg_tables`, `pg_policies`, grants, views, functions.
@@ -99,8 +154,36 @@ Airlock audits the *logic* of your policies, not just their presence.
    (a `service_role` JWT or an `sb_secret_...` key). It bypasses *every* RLS
    policy at once, so whoever reads it owns your database. Scanned straight from
    your deployed site — no database needed (see below).
+10. **`policy_trusts_user_metadata`** — a policy that decides access from
+   `user_metadata`: `auth.jwt() -> 'user_metadata'`, the `#>> '{user_metadata,…}'`
+   path form, or `auth.users.raw_user_meta_data` (also inside a subquery). Every
+   signed-in user can rewrite their own user_metadata from the browser with
+   `supabase.auth.updateUser({ data })`, so anyone who signs up passes the check:
+   `(auth.jwt()->'user_metadata'->>'role') = 'admin'` is an admin gate they can
+   open, and `org_id = (auth.jwt()->'user_metadata'->>'org_id')::uuid` is a tenant
+   id they can set to someone else's (this one looked scoped and used to pass).
+   **Fail** on a permissive policy reachable by `authenticated` (downgraded to a
+   warn only when a restrictive policy that doesn't itself trust user_metadata
+   scopes every command); **warn** on a RESTRICTIVE policy (its narrowing can be
+   bypassed) and on a client-callable SECURITY DEFINER function whose body reads
+   it (e.g. an `is_admin()` helper). `app_metadata` / `raw_app_meta_data`
+   (server-only) never fires; neither do the words inside a string literal, a
+   policy only `TO anon`, or a table authenticated holds no grant on. Waive with
+   `table.policy` (or `fn:<name>` for a function).
 
 **Warns (worth a review):**
+- **`default_privileges_to_api_roles`** — `ALTER DEFAULT PRIVILEGES` that hand
+  every *future* table to `anon` / `authenticated` (or `PUBLIC`). Since Supabase's
+  Oct 30, 2026 change, new tables in `public` are no longer granted to the API
+  roles, and the quickest way to silence the resulting `42501 permission denied`
+  is a blanket default grant. Nothing leaks because of it today, but the next
+  table whose migration forgets `ENABLE ROW LEVEL SECURITY` ships open. One warn
+  per owner and schema, naming the privileges (writes called out). Defaults owned
+  by Supabase-managed roles (`supabase_admin`, `supabase_*`, `pg_*`,
+  `service_role`, …) are the platform's own and are never flagged; defaults owned
+  by `postgres` or any custom role are. Waive with `defaults:<owner>`. The
+  one-off `GRANT ALL ON ALL TABLES` form leaves only per-table grants, which the
+  existing rules already judge (RLS off → `rls_disabled`).
 - **`or_branch_unscoped`** — the policy scopes to `auth.uid()` but an `OR` branch
   widens it in a way a static scan can't prove restricts (`auth.uid() = owner OR
   status = 'published'`, `OR deleted_at IS NULL`, an exotic tautology). It may be
@@ -233,6 +316,109 @@ the check). `--json` always includes it, as `fixPrompt` on each finding.
 npx airlock-rls "$SUPABASE_DB_URL" --prompts
 ```
 
+### A draft fix migration (`--fix-sql`)
+
+```bash
+npx airlock-rls "$SUPABASE_DB_URL" --fix-sql airlock-fix.sql
+```
+
+Writes a **draft** migration for this audit, wrapped in `begin; … commit;`:
+
+- **Mechanical fixes as real SQL**, each with a note on what it can break:
+
+  | Finding | Statement |
+  |---|---|
+  | `rls_disabled` | `alter table … enable row level security;` (+ a commented policy template: RLS with no policy locks the table for the API) |
+  | `anon_executes_definer` | `revoke execute on function … from public, anon;` |
+  | `definer_search_path_mutable` | `alter function … set search_path = '';` |
+  | `view_bypasses_rls` | `alter view … set (security_invoker = true);` |
+  | `matview_exposed` | `revoke select on … from anon, authenticated;` |
+  | `public_bucket` | `update storage.buckets set public = false where id = '…';` |
+  | `owner_bypasses_rls` | `alter table … force row level security;` |
+
+- **Everything that needs a decision is a commented `TODO`**: permissive or
+  unscoped policies (a `drop policy` / `create policy` template with an
+  `<owner_column>` placeholder — a policy is never rewritten automatically),
+  a SECURITY DEFINER function callable by `authenticated`, Realtime exposure,
+  a `BYPASSRLS` role, and DAST-proven anon reads/writes.
+
+Identifiers are always double-quoted from the catalog spelling, so names with
+spaces, uppercase or quotes apply correctly. Allow-listed findings are never
+included. Review it before applying, then re-run `npx airlock-rls`.
+
+With `--json`, the "written to" note goes to stderr so stdout stays valid JSON.
+
+### GitHub code scanning (SARIF) and annotations
+
+Two outputs make findings show up where you already look on GitHub. Both are
+**additive**: the normal report still prints and the exit code doesn't change.
+
+```bash
+npx airlock-rls "$SUPABASE_DB_URL" --sarif airlock.sarif   # also write a SARIF 2.1.0 log
+npx airlock-rls "$SUPABASE_DB_URL" --format github         # also print ::error / ::warning annotations
+```
+
+- **`--sarif <file>`** writes a SARIF 2.1.0 log (validated against the official
+  OASIS schema in the test suite): one rule per finding kind, `fail` → `error`,
+  `warn` → `warning`, the finding's detail as the message, a stable fingerprint,
+  and the copy-paste fix prompt under `properties.fixPrompt`.
+- **`--format github`** prints one workflow command per finding, so GitHub
+  renders it as an annotation on the run. It's skipped under `--json`, which
+  stays parseable. Also read from `$AIRLOCK_FORMAT`.
+
+**Where a finding points.** A finding from the live database has no file: its
+location is the database object (`public.payments`, `notes."read all"`), as a
+SARIF *logical* location. A finding that carries a file and line (from a
+migrations file) gets a *physical* location, and GitHub points at that line.
+
+#### Upload to code scanning (GitHub Action)
+
+```yaml
+permissions:
+  contents: read
+  security-events: write   # needed by upload-sarif
+
+steps:
+  - uses: actions/checkout@v4
+  - uses: mateuszingano/airlock-rls@v1
+    with:
+      db-url: ${{ secrets.SUPABASE_DB_URL }}
+      sarif: airlock.sarif
+  - uses: github/codeql-action/upload-sarif@v3
+    if: always()            # the gate fails the step on a leak; upload anyway
+    with:
+      sarif_file: airlock.sarif
+      category: airlock-rls
+```
+
+The `sarif` input only adds the file; the gate still fails the job on a leak.
+
+> Note: GitHub code scanning is built around files. Database findings carry a
+> logical location only, so they may show without a line link (or, depending on
+> GitHub's ingestion rules, not as an alert at all). Findings with a file and
+> line (migrations mode) map cleanly. `--format github` annotations work for both.
+
+### Use it from a coding agent (skill)
+
+Airlock ships an agent skill so Claude Code, Cursor and other agents that support skills can
+run the audit and fix what it finds, without you remembering the flags:
+
+```bash
+npx skills add https://github.com/mateuszingano/airlock-rls --skill airlock-rls
+```
+
+Or copy `skills/airlock-rls/` into `~/.claude/skills/` (Claude Code). Then ask your agent:
+
+```
+audit the RLS of this Supabase project
+is my deployed app leaking a service key? https://your-app.com
+```
+
+The skill picks the mode (site scan with just a URL, or the full DB audit from
+`$SUPABASE_DB_URL`, never printing it), reads the `--json` findings, turns each `fixPrompt` into
+a migration it shows you before applying, never "fixes" by disabling RLS or writing
+`USING (true)`, and re-runs the check to confirm.
+
 ---
 
 ## Use it as a GitHub Action (the gate)
@@ -271,6 +457,7 @@ the merge is blocked. A full example lives in [`examples/rls-gate.yml`](examples
 | `url`          | no       | `''`       | Supabase project URL. With `anon-key`, runs the DAST pass that **proves** exposure. |
 | `anon-key`     | no       | `''`       | Public anon key for the DAST pass (public by design). Used with `url`. |
 | `dast-write`   | no       | `false`    | Also probe anonymous INSERTs during DAST (safe — leaves no test data). |
+| `sarif`        | no       | `''`       | Also write a SARIF 2.1.0 log to this path (upload it with `github/codeql-action/upload-sarif`). |
 | `node-version` | no       | `20`       | Node.js version used to run the audit.                            |
 
 ---
@@ -317,10 +504,17 @@ Get the URL from `supabase status` (local) or your project's connection string.
                    and public source maps. Needs no database ($SUPABASE_SITE_URL).
 --prompts          Print a copy-paste fix prompt for each problem (Cursor,
                    Lovable, Bolt, Claude Code).
+--fix-sql <file>   Write a DRAFT fix migration (mechanical fixes as SQL,
+                   decisions as commented TODOs). Review before applying.
+--sarif <file>     Also write a SARIF 2.1.0 log (GitHub code scanning).
+--format github    Also print ::error / ::warning annotations.
+--no-default-grants  (migrations) Don't emulate the pre-Oct-30 auto-grant.
 --json             Print the result as JSON instead of a report.
 -h, --help         Show help.
 -v, --version      Show the version.
 ```
+
+`airlock migrations [PATH...]` audits SQL migrations (default `supabase/migrations`) with no database.
 
 The DB URL is optional when you pass `--site`: `airlock --site https://your-app.com`
 runs the service-key scan on its own, with no database.

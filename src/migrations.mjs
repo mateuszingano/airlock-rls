@@ -24,6 +24,10 @@
 
 import { readdir, readFile, stat } from 'node:fs/promises'
 import path from 'node:path'
+import os from 'node:os'
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { pathToFileURL } from 'node:url'
 
 // ---------------------------------------------------------------------------
 // SQL splitting (pure). Splits on top-level `;`, respecting '...' strings
@@ -378,16 +382,70 @@ export function attachLocations(findings, applied) {
 
 const rel = (p) => path.relative(process.cwd(), p).split(path.sep).join('/') || p
 
+// The embedded Postgres is ~27 MB. It is NOT a dependency of airlock-rls, so
+// `npx airlock-rls` stays small for everyone who never uses this mode. The
+// first `airlock migrations` run installs these exact versions into a cache
+// directory (once) and loads them from there.
+export const PGLITE_VERSION = '0.5.15'
+export const PGLITE_SOCKET_VERSION = '0.2.18'
+
+function pgliteCacheDir() {
+  return process.env.AIRLOCK_CACHE_DIR ||
+    path.join(os.homedir(), '.cache', 'airlock-rls', `pglite-${PGLITE_VERSION}-socket-${PGLITE_SOCKET_VERSION}`)
+}
+
+/**
+ * An `import()` that resolves bare specifiers from the PGlite cache. A dynamic
+ * import resolves relative to the module that calls it, so a one-line module
+ * written inside the cache directory sees the cache's node_modules.
+ */
+async function cachedImporter() {
+  const dir = pgliteCacheDir()
+  const loader = path.join(dir, 'airlock-load.mjs')
+  const installed = existsSync(path.join(dir, 'node_modules', '@electric-sql', 'pglite-socket', 'package.json'))
+  if (!installed) {
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(path.join(dir, 'package.json'), '{"private":true}\n')
+    process.stderr.write(`airlock: downloading the embedded Postgres for the migrations mode (~27 MB, one time) into ${dir}\n`)
+    const args = [
+      'install', '--no-save', '--no-audit', '--no-fund', '--loglevel=error', '--prefix', dir,
+      `@electric-sql/pglite@${PGLITE_VERSION}`, `@electric-sql/pglite-socket@${PGLITE_SOCKET_VERSION}`,
+    ]
+    const opts = { stdio: ['ignore', 'ignore', 'inherit'] }
+    // Windows: npm is npm.cmd, which only runs through a shell. Pass ONE
+    // quoted command string, so a home folder with a space ("C:\Users\Ana
+    // Silva") stays one argument. The args are ours (versions + cache path),
+    // never user input; a quote in the path is refused rather than escaped.
+    if (process.platform === 'win32' && /"/.test(dir)) throw new Error(`Unsupported cache path: ${dir}`)
+    const r = process.platform === 'win32'
+      ? spawnSync(`npm ${args.map((a) => `"${a}"`).join(' ')}`, { ...opts, shell: true })
+      : spawnSync('npm', args, opts)
+    if (r.status !== 0) {
+      throw new Error(`npm install into ${dir} failed (exit ${r.status}). Install it yourself with: ` +
+        `npm install -g @electric-sql/pglite@${PGLITE_VERSION} @electric-sql/pglite-socket@${PGLITE_SOCKET_VERSION}`)
+    }
+  }
+  if (!existsSync(loader)) writeFileSync(loader, 'export const imp = (s) => import(s)\n')
+  return (await import(pathToFileURL(loader).href)).imp
+}
+
 async function loadPglite() {
   try {
+    // A local install (repo checkout, devDependency) wins; otherwise the cache.
+    let imp = (s) => import(s)
+    try {
+      await import('@electric-sql/pglite')
+    } catch {
+      imp = await cachedImporter()
+    }
     const [{ PGlite }, { PGLiteSocketServer }] = await Promise.all([
-      import('@electric-sql/pglite'),
-      import('@electric-sql/pglite-socket'),
+      imp('@electric-sql/pglite'),
+      imp('@electric-sql/pglite-socket'),
     ])
     const extensions = {}
     for (const [sqlName, mod] of Object.entries(CONTRIB)) {
       try {
-        const m = await import(`@electric-sql/pglite/contrib/${mod}`)
+        const m = await imp(`@electric-sql/pglite/contrib/${mod}`)
         extensions[mod] = m[mod] || Object.values(m)[0]
       } catch {
         // not available in this PGlite build: CREATE EXTENSION will be skipped
@@ -395,7 +453,7 @@ async function loadPglite() {
       }
     }
     try {
-      const { vector } = await import('@electric-sql/pglite/vector')
+      const { vector } = await imp('@electric-sql/pglite/vector')
       extensions.vector = vector
     } catch {
       // pgvector not bundled: `create extension vector` is skipped and counted
@@ -436,7 +494,16 @@ export async function auditMigrations({ paths = ['supabase/migrations'], schema 
   let server
   try {
     await db.exec(BOOTSTRAP_SQL)
-    if (defaultGrants) await db.exec(DEFAULT_GRANTS_SQL)
+    // The legacy auto-grant is emulated with default privileges, which is the
+    // exact footprint the default_privileges_to_api_roles rule looks for. Take
+    // a snapshot so the emulation can be taken back out before the audit.
+    const DEFACL_SQL = `select defaclobjtype as t, defaclacl::text as acl from pg_default_acl
+      where defaclrole = 'postgres'::regrole and defaclnamespace = 'public'::regnamespace`
+    let emulatedAcl = new Map()
+    if (defaultGrants) {
+      await db.exec(DEFAULT_GRANTS_SQL)
+      emulatedAcl = new Map((await db.query(DEFACL_SQL)).rows.map((r) => [r.t, r.acl]))
+    }
 
     for (const file of files) {
       const text = await readFile(file, 'utf8')
@@ -473,6 +540,21 @@ export async function auditMigrations({ paths = ['supabase/migrations'], schema 
     if (info.applied === 0) {
       const why = info.failed[0] ? ` First error: ${info.failed[0].file}:${info.failed[0].line}: ${info.failed[0].error}` : ''
       throw new MigrationsUsageError(`Nothing could be loaded from ${info.files.length} file(s), so nothing was audited.${why}`)
+    }
+
+    // Take OUR emulated default privileges back out (the grants they already
+    // produced on loaded tables stay). Only a row still identical to the
+    // emulation is removed: if a migration changed it (e.g. the Oct 30 "lazy
+    // fix" granting more), it is the user's and the rule must see it. Known
+    // blind spot: a migration that re-grants exactly what the emulation did is
+    // indistinguishable here; --no-default-grants catches it.
+    if (emulatedAcl.size) {
+      const OBJ = { r: 'tables', S: 'sequences', f: 'functions' }
+      for (const r of (await db.query(DEFACL_SQL)).rows) {
+        if (OBJ[r.t] && emulatedAcl.get(r.t) === r.acl) {
+          await db.exec(`alter default privileges in schema public revoke all on ${OBJ[r.t]} from anon, authenticated, service_role`)
+        }
+      }
     }
 
     server = new PGLiteSocketServer({ db, port: 0, host: '127.0.0.1', maxConnections: 4 })

@@ -10,6 +10,7 @@ the default; `--fail-on warn` makes warns break the build too. A `storage_` pref
 | kind | Meaning |
 |---|---|
 | `rls_disabled` | A table the API roles can reach has RLS off: every row is exposed. |
+| `policy_trusts_user_metadata` | A policy decides access from `user_metadata` (`auth.jwt() -> 'user_metadata'` or `auth.users.raw_user_meta_data`), which every user can edit with `auth.updateUser()`. Warn instead when only a restrictive policy or a SECURITY DEFINER body reads it. Fix: move the value to `app_metadata` or a table users can't write. |
 | `permissive_true` | A policy is `USING (true)` / `WITH CHECK (true)` or reduces to always-true (`auth.uid() = x OR 1=1`, `owner_id = owner_id`). |
 | `anon_unscoped` | An anon-readable policy that doesn't scope to the user: everyone reads every row. |
 | `write_unscoped` | An INSERT/UPDATE whose `WITH CHECK` doesn't tie the new row to the caller: anyone can write rows as someone else. |
@@ -40,6 +41,8 @@ the default; `--fail-on warn` makes warns break the build too. A `storage_` pref
 | `realtime_exposure` | A table published to Realtime whose rows are anon-readable: changes stream to anonymous listeners. |
 | `bypassrls_role` | A role with BYPASSRLS/SUPERUSER outside the Supabase-managed set, or any bypass role the API caller can reach. |
 | `owner_bypasses_rls` | A table owned by a client-reachable role without `FORCE ROW LEVEL SECURITY`. |
+| `default_privileges_to_api_roles` | Default privileges hand every future table to anon/authenticated/PUBLIC (the post-Oct-30 "lazy fix"). Nothing leaks today; the next table without RLS will. Waive with `defaults:<owner>`. |
+| `migrations_incomplete` | Migrations mode: some statements failed to load, so what they create was not audited. |
 | `source_map_exposed` | Site scan: public source maps expose the original source code. |
 | `scan_truncated` | Site scan read only the first N bundles; raise `--max-scripts`. |
 | `check_skipped` | A check couldn't run (e.g. missing catalog access); the report says which. |
