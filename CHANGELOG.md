@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **Action: `comment: true` keeps the result as a comment on the pull request.** One
+  comment per PR, found by a hidden marker and edited on every push. Built from the
+  SARIF the gate already writes, so the audit runs once. Needs `pull-requests: write`;
+  without it, or on a PR from a fork, the comment is skipped with a notice and the
+  gate is unchanged. Proven on every PR by `.github/workflows/action-selftest.yml`,
+  which runs the Action against a schema with planted leaks.
+
 ## 0.6.0 — 2026-11-07
 
 - **`airlock migrations`: audit without a database.** Replays your SQL migrations

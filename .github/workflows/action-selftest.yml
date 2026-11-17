@@ -1,0 +1,47 @@
+name: action self-test
+
+# Runs the Action from this checkout (`uses: ./`) against a schema with planted
+# leaks: the gate must fail, and on a pull request it keeps one comment on the
+# PR with the result (comment: true).
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  leaky-schema:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DB_URL: postgresql://postgres:postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - name: Load the leaky fixture
+        run: psql "$DB_URL" -v ON_ERROR_STOP=1 -f test/fixtures/leaky.sql
+      - name: Airlock gate (expected to fail)
+        id: airlock
+        continue-on-error: true
+        uses: ./
+        with:
+          db-url: ${{ env.DB_URL }}
+          schema: app
+          comment: true
+      - name: The gate must have blocked the leaks
+        if: steps.airlock.outcome != 'failure'
+        run: |
+          echo "::error::The gate passed a schema with planted leaks."
+          exit 1
