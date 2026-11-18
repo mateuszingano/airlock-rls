@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.0 — 2026-11-17
 
 - **Action: `comment: true` keeps the result as a comment on the pull request.** One
   comment per PR, found by a hidden marker and edited on every push. Built from the
