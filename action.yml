@@ -47,6 +47,14 @@ inputs:
     description: 'Node.js version used to run the audit.'
     required: false
     default: '20'
+  comment:
+    description: 'Set to "true" to keep one comment on the pull request with the result, updated on every push. Needs "permissions: pull-requests: write" in the workflow; without it (or on a PR from a fork) the comment is skipped with a notice and the gate still runs.'
+    required: false
+    default: 'false'
+  github-token:
+    description: 'Token used to post the pull request comment. The default job token is enough.'
+    required: false
+    default: ${{ github.token }}
 
 runs:
   using: 'composite'
@@ -67,16 +75,20 @@ runs:
     # command execution on their runner, which holds SUPABASE_DB_URL.
     # DAST_WRITE_FLAG is a literal picked by the ternary (never caller text), so
     # leaving it unquoted is safe and lets the empty case expand to no argument.
+    # With comment: true and no sarif input, the SARIF goes to a temp file: the
+    # comment step reads it instead of running the audit a second time.
     - name: Run RLS audit (the gate)
+      id: gate
       shell: bash
-      run: >
-        node "$GITHUB_ACTION_PATH/bin/airlock.mjs"
-        --schema "$INPUT_SCHEMA"
-        $DAST_WRITE_FLAG
-        ${INPUT_SARIF:+--sarif "$INPUT_SARIF"}
+      run: |
+        SARIF="$INPUT_SARIF"
+        if [ "$INPUT_COMMENT" = "true" ] && [ -z "$SARIF" ]; then SARIF="$RUNNER_TEMP/airlock-rls.sarif"; fi
+        echo "sarif=$SARIF" >> "$GITHUB_OUTPUT"
+        node "$GITHUB_ACTION_PATH/bin/airlock.mjs" --schema "$INPUT_SCHEMA" $DAST_WRITE_FLAG ${SARIF:+--sarif "$SARIF"}
       env:
         INPUT_SCHEMA: ${{ inputs.schema }}
         INPUT_SARIF: ${{ inputs.sarif }}
+        INPUT_COMMENT: ${{ inputs.comment }}
         RLS_AUDIT_FAIL_ON: ${{ inputs.fail-on }}
         DAST_WRITE_FLAG: ${{ inputs.dast-write == 'true' && '--dast-write' || '' }}
         SUPABASE_DB_URL: ${{ inputs.db-url }}
@@ -84,3 +96,14 @@ runs:
         SUPABASE_SITE_URL: ${{ inputs.site }}
         SUPABASE_URL: ${{ inputs.url }}
         SUPABASE_ANON_KEY: ${{ inputs.anon-key }}
+
+    # Runs even when the gate failed (that is when the comment matters most).
+    - name: Comment on the pull request
+      if: always() && inputs.comment == 'true' && (github.event_name == 'pull_request' || github.event_name == 'pull_request_target')
+      shell: bash
+      run: node "$GITHUB_ACTION_PATH/bin/pr-comment.mjs"
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        AIRLOCK_SARIF: ${{ steps.gate.outputs.sarif }}
+        AIRLOCK_OUTCOME: ${{ steps.gate.outcome }}
+        INPUT_SCHEMA: ${{ inputs.schema }}

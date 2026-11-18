@@ -446,6 +446,31 @@ jobs:
 If any table is exposed or any policy is permissive, the job exits non-zero and
 the merge is blocked. A full example lives in [`examples/rls-gate.yml`](examples/rls-gate.yml).
 
+### Result as a comment on the pull request
+
+Add `comment: true` and give the job permission to write PR comments. The
+Action keeps one comment on the PR with what it found, and edits it on every
+push instead of adding new ones:
+
+```yaml
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  rls-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: mateuszingano/airlock-rls@v1
+        with:
+          db-url: ${{ secrets.SUPABASE_DB_URL }}
+          comment: true
+```
+
+The comment never blocks anything by itself: without the permission, or on a PR
+from a fork (whose token is read-only), it is skipped with a notice and the gate
+runs as usual.
+
 ### Action inputs
 
 | Input          | Required | Default    | Description                                                        |
@@ -458,6 +483,8 @@ the merge is blocked. A full example lives in [`examples/rls-gate.yml`](examples
 | `anon-key`     | no       | `''`       | Public anon key for the DAST pass (public by design). Used with `url`. |
 | `dast-write`   | no       | `false`    | Also probe anonymous INSERTs during DAST (safe — leaves no test data). |
 | `sarif`        | no       | `''`       | Also write a SARIF 2.1.0 log to this path (upload it with `github/codeql-action/upload-sarif`). |
+| `comment`      | no       | `false`    | `true` keeps one comment on the pull request with the result. Needs `pull-requests: write`. |
+| `github-token` | no       | job token  | Token used to post the comment.                                    |
 | `node-version` | no       | `20`       | Node.js version used to run the audit.                            |
 
 ---
